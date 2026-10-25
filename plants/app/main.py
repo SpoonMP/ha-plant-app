@@ -44,7 +44,7 @@ from . import db
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 # Only the Supervisor's ingress proxy may talk to the app (plus localhost for testing).
 ALLOWED_CLIENTS = {"172.30.32.2", "127.0.0.1", "::1"}
@@ -238,7 +238,24 @@ async def api_import(request):
 
 
 async def api_health(request):
-    return ok({"ok": True, "version": VERSION})
+    def ls(path):
+        try:
+            return sorted(os.listdir(path))
+        except OSError as e:
+            return f"error: {e.strerror}"
+    return ok({
+        "ok": True,
+        "version": VERSION,
+        "db_path": db.DB_PATH,
+        "db_exists": os.path.exists(db.DB_PATH),
+        "data_dir": ls(db.DATA_DIR),
+        "tz_env": os.environ.get("TZ"),
+        "local_time": datetime.now().isoformat(timespec="seconds"),
+        "tzname": list(time.tzname),
+        "env_names": sorted(k for k in os.environ if not k.startswith("_")),
+        "s6_env_dir": ls("/run/s6/container_environment"),
+        "mounts": [l.split()[1] for l in open("/proc/mounts") if l.split()[1].startswith(("/data", "/run/s6"))],
+    })
 
 
 @asynccontextmanager
