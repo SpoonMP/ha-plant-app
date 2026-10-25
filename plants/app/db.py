@@ -9,7 +9,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-DATA_DIR = os.environ.get("PLANTS_DATA_DIR", "/data")
+DATA_DIR = os.environ.get("PLANTS_DATA_DIR", "/data").strip()
 DB_PATH = os.path.join(DATA_DIR, "plants.db")
 
 SCHEMA_VERSION = 1

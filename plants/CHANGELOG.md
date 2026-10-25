@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Fix: the time zone and data folder were read with a trailing line break, so times showed in UTC and data saved by 0.1.1–0.1.2 was kept outside Home Assistant's storage (lost on update). Data now always goes to /data.
+
 ## 0.1.2
 
 - Health check shows storage and time zone details.
