@@ -7,7 +7,30 @@ All page and API paths are relative so they work under the ingress URL.
 
 import json
 import os
+import time
 from contextlib import asynccontextmanager
+
+
+def _load_container_env() -> None:
+    """Pick up the variables Home Assistant gives the app (TZ, SUPERVISOR_TOKEN).
+
+    The base image's init (S6 overlay) starts the program with a cleaned
+    environment and keeps the container's variables as files in this folder.
+    """
+    env_dir = "/run/s6/container_environment"
+    if os.path.isdir(env_dir):
+        for name in os.listdir(env_dir):
+            if name not in os.environ:
+                try:
+                    with open(os.path.join(env_dir, name), encoding="utf-8") as f:
+                        os.environ[name] = f.read()
+                except OSError:
+                    pass
+    if os.environ.get("TZ"):
+        time.tzset()
+
+
+_load_container_env()
 from datetime import datetime, timedelta
 
 from starlette.applications import Starlette
@@ -21,7 +44,7 @@ from . import db
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Only the Supervisor's ingress proxy may talk to the app (plus localhost for testing).
 ALLOWED_CLIENTS = {"172.30.32.2", "127.0.0.1", "::1"}
