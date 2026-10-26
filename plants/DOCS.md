@@ -5,6 +5,8 @@
 - **Home:** tiles grouped by area, then spot. Tap a tile to open the plant.
 - **Plant page:** location, watering rule, next check, grow light, pot and care notes, plus the plant's location history. **Edit details** changes any of these; changing the spot or position is logged as a move.
 - **Photos:** take the photo with the phone's camera app, then on the plant page tap **Add photo** and pick it; add a note if you like, then **Save photo**. (The Home Assistant phone app always opens the file picker, not the camera.) The camera icon at the top of the home screen does the same for any plant. Swipe the big photo to go back through older ones; **Delete** removes the one showing.
+- **Watering:** on a plant page, **Watered** logs a watering (tick **with feed** if you fed it); **Checked, still moist** logs a check where it didn't need water. Delete a wrong entry from the history with ✕.
+- **Water round:** the button on the home screen lists every plant by area. Tap **Watered** or **Moist** for each one you looked at (tap again to clear), tick **feed** where you fed, then **Save**.
 - **Settings (gear icon):** add, edit or remove plants; add, rename, reorder or remove areas and spots; import or export the plant list.
 
 ## Plant numbers
@@ -40,6 +42,9 @@ With the Mosquitto broker app installed, each plant appears in Home Assistant as
 - `camera.plant_7` — the latest photo (~1024 px); photo date, note and plant details as attributes
 - `sensor.plant_7_last_photo` — when the latest photo was taken
 - `sensor.plant_7_location` — area › spot · position
+- `sensor.plant_7_last_watered`, `sensor.plant_7_last_fed` — from the watering log
+- `sensor.plant_7_next_check` — the next Water check (Wed 19:00) or Plant check (Sun 15:00)
+- `button.plant_7_watered` — logs a watering, e.g. from a dashboard
 
 Entity IDs are set when a plant first appears; renaming the plant later changes the device name, not the IDs.
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Watering log: **Watered** (optionally **with feed**) and **Checked, still moist** on each plant page, with a history you can delete entries from.
+- **Water round** (button on the home screen): mark each plant Watered / Moist, with a feed tick, and save them all in one go.
+- Tiles show when each plant was last watered.
+- Home Assistant: per plant **Last watered**, **Last fed** and **Next check** sensors, and a **Watered** button (`button.plant_7_watered`) that logs a watering from HA.
+- Export includes the watering log.
+
 ## 0.2.2
 
 - One **Add photo** button instead of Take photo / From gallery: the Companion app always opens the file picker, so photos are taken with the camera app first and picked here.

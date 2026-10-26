@@ -12,7 +12,7 @@ from datetime import datetime
 DATA_DIR = os.environ.get("PLANTS_DATA_DIR", "/data").strip()
 DB_PATH = os.path.join(DATA_DIR, "plants.db")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS photos (
     bytes        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS photos_by_plant ON photos (plant_number, taken_at);
+CREATE TABLE IF NOT EXISTS care_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_number INTEGER NOT NULL REFERENCES plants(number) ON DELETE CASCADE,
+    at           TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK (kind IN ('watered', 'checked')),
+    fed          INTEGER NOT NULL DEFAULT 0,
+    note         TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT 'app'
+);
+CREATE INDEX IF NOT EXISTS care_by_plant ON care_log (plant_number, at);
 """
 
 PLANT_TEXT_FIELDS = (
@@ -161,6 +171,7 @@ def plant_dict(con, row) -> dict:
     d["photo_count"] = con.execute(
         "SELECT COUNT(*) FROM photos WHERE plant_number=?", (d["number"],)
     ).fetchone()[0]
+    d.update(care_summary(con, d["number"]))
     return d
 
 
@@ -197,6 +208,7 @@ def get_plant(con, number: int) -> dict:
         )
     ]
     d["photos"] = list_photos(con, number)
+    d["care_log"] = list_care(con, number)
     return d
 
 
@@ -349,6 +361,55 @@ def plant_numbers(con) -> list:
     return [r[0] for r in con.execute("SELECT number FROM plants ORDER BY number")]
 
 
+# ---------- watering ----------
+
+CARE_KINDS = ("watered", "checked")
+CARE_FIELDS = "id, plant_number, at, kind, fed, note, source"
+
+
+def care_summary(con, number: int) -> dict:
+    """Last watered / last checked (either kind) / last fed for a plant."""
+    def last(where: str):
+        row = con.execute(
+            f"SELECT MAX(at) FROM care_log WHERE plant_number=? AND {where}", (number,)
+        ).fetchone()
+        return row[0] if row else None
+    return {
+        "last_watered": last("kind='watered'"),
+        "last_checked": last("1=1"),
+        "last_fed": last("fed=1"),
+    }
+
+
+def list_care(con, number: int, limit: int = 30) -> list:
+    return [dict(r) for r in con.execute(
+        f"SELECT {CARE_FIELDS} FROM care_log WHERE plant_number=? ORDER BY at DESC, id DESC LIMIT ?",
+        (number, limit),
+    )]
+
+
+def add_care(con, number: int, kind: str, fed: bool = False, note: str = "",
+             source: str = "app", at: str | None = None) -> int:
+    if kind not in CARE_KINDS:
+        raise UserError("Unknown entry — use watered or checked.")
+    if not con.execute("SELECT 1 FROM plants WHERE number=?", (number,)).fetchone():
+        raise KeyError(number)
+    if fed and kind != "watered":
+        raise UserError("Feed is only logged together with watering.")
+    return con.execute(
+        "INSERT INTO care_log (plant_number, at, kind, fed, note, source) VALUES (?,?,?,?,?,?)",
+        (number, at or now_iso(), kind, 1 if fed else 0, (note or "").strip()[:500], source),
+    ).lastrowid
+
+
+def delete_care(con, care_id: int) -> int:
+    row = con.execute("SELECT plant_number FROM care_log WHERE id=?", (care_id,)).fetchone()
+    if not row:
+        raise KeyError(care_id)
+    con.execute("DELETE FROM care_log WHERE id=?", (care_id,))
+    return row[0]
+
+
 # ---------- area / spot writes ----------
 
 def create_area(con, name: str) -> int:
@@ -452,6 +513,12 @@ def export_all(con) -> dict:
                 (r["number"],),
             )
         ]
+        p["care_log"] = [
+            dict(x) for x in con.execute(
+                "SELECT at, kind, fed, note, source FROM care_log WHERE plant_number=? ORDER BY at, id",
+                (r["number"],),
+            )
+        ]
         plants.append(p)
     return {
         "format": "ha-plant-app",
@@ -507,5 +574,8 @@ def import_all(con, data: dict) -> dict:
                     "INSERT INTO location_log (plant_number, at, from_text, to_text) VALUES (?,?,?,?)",
                     (number, entry["at"], entry["from_text"], entry["to_text"]),
                 )
+            for entry in p.get("care_log", []) or []:
+                add_care(con, number, entry["kind"], bool(entry.get("fed")), entry.get("note", ""),
+                         entry.get("source", "import"), entry["at"])
             added += 1
     return {"added": added, "updated": updated}

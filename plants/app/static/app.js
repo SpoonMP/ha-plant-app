@@ -186,9 +186,13 @@ async function viewHome() {
       <div class="tile-body">
         <div class="tile-name">${esc(p.name)}</div>
         <div class="tile-sub">${p.position ? esc(p.position) : esc(p.species) || "&nbsp;"}</div>
+        <span class="chip${p.last_watered ? "" : " dim"}">${p.last_watered ? "💧 " + esc(ago(p.last_watered)) : "💧 not logged"}</span>
         <span class="chip${p.latest_photo ? "" : " dim"}">${p.latest_photo ? "📷 " + esc(ago(p.latest_photo.taken_at)) : "No photo"}</span>
       </div></a>`;
-  let html = `<p class="summary">${data.count} plants · next: ${esc(data.next_check.label)}, ${esc(fmtWhen(data.next_check.at))}</p>`;
+  let html = `<div class="home-head">
+      <p class="summary">${data.count} plants · next: ${esc(data.next_check.label)}, ${esc(fmtWhen(data.next_check.at))}</p>
+      <a class="btn primary" href="#/round">💧 Water round</a>
+    </div>`;
   for (const a of data.areas) {
     const spots = a.spots.filter(s => s.plants.length);
     if (!spots.length) continue;
@@ -220,18 +224,136 @@ async function viewPlant(number) {
     </div>
     <div class="card"><dl class="facts">
       ${fact("Location", p.location)}
-      ${fact("Watering", p.watering_rule)}
-      ${fact("Next check", `${p.next_check.label}, ${fmtWhen(p.next_check.at)}`)}
-      ${fact("Grow light", p.grow_light)}
+        ${fact("Grow light", p.grow_light)}
       ${fact("Pot", p.pot)}
       ${fact("Soil sensor", p.soil_sensor)}
     </dl></div>
     ${p.care_notes ? `<div class="card"><h3>Care notes</h3><p class="prose">${esc(p.care_notes)}</p></div>` : ""}
-    <div class="card"><h3>Watering &amp; diagnoses</h3><p class="later">Coming in the next stages: last watered, soil readings and Claude's diagnoses.</p></div>
+    ${wateringCard(p)}
+    <div class="card"><h3>Diagnoses</h3><p class="later">Coming in the next stage: Claude's diagnoses from the “plant check” in chat.</p></div>
     <div class="card"><h3>Location history</h3>${log}</div>
     <div class="row-actions"><a class="btn" href="#/plant/${p.number}/edit">Edit details</a></div>`;
   wireGallery(p);
+  wireWatering(p);
   onPick("pp", file => { pendingPhoto = { number: p.number, file }; location.hash = `#/photo/${p.number}`; });
+}
+
+function careLine(c) {
+  const what = c.kind === "watered" ? (c.fed ? "Watered + fed" : "Watered") : "Checked, still moist";
+  const via = c.source === "ha" ? " · from HA" : c.source === "round" ? " · water round" : "";
+  return `<li data-care="${c.id}"><span class="grow"><strong>${what}</strong> <span class="muted">${esc(fmtWhen(c.at))}${via}</span>${c.note ? `<br>${esc(c.note)}` : ""}</span>
+    <button class="btn icon small-x" data-act="care-del" aria-label="Delete entry">✕</button></li>`;
+}
+
+function wateringCard(p) {
+  const fact = (label, value) => `<div><dt>${label}</dt><dd>${value}</dd></div>`;
+  const when = iso => iso ? `${esc(ago(iso))} <span class="muted">· ${esc(fmtWhen(iso))}</span>` : `<span class="muted">not logged yet</span>`;
+  const log = p.care_log.length
+    ? `<ul class="log care">${p.care_log.slice(0, 10).map(careLine).join("")}</ul>`
+    : `<p class="later">Nothing logged yet.</p>`;
+  return `<div class="card"><h3>Watering</h3>
+    <dl class="facts">
+      ${p.watering_rule ? fact("Rule", esc(p.watering_rule)) : ""}
+      ${fact("Last watered", when(p.last_watered))}
+      ${fact("Last checked", when(p.last_checked))}
+      ${fact("Last fed", when(p.last_fed))}
+      ${fact("Next check", `${esc(p.next_check.label)}, ${esc(fmtWhen(p.next_check.at))}`)}
+    </dl>
+    <div class="row-actions care-actions">
+      <button class="btn primary" id="w-water">💧 Watered</button>
+      <label class="check"><input type="checkbox" id="w-fed"> with feed</label>
+      <button class="btn" id="w-check">Checked, still moist</button>
+    </div>
+    <h3>History</h3>${log}</div>`;
+}
+
+function wireWatering(p) {
+  const log = async (kind) => {
+    const fed = kind === "watered" && document.getElementById("w-fed").checked;
+    try {
+      await api(`plants/${p.number}/care`, { json: { kind, fed } });
+      toast(kind === "watered" ? (fed ? "Watered + fed" : "Watered") : "Checked");
+      await viewPlant(p.number);
+    } catch (err) { toast(err.message, true); }
+  };
+  document.getElementById("w-water").addEventListener("click", () => log("watered"));
+  document.getElementById("w-check").addEventListener("click", () => log("checked"));
+  view.querySelectorAll('[data-act="care-del"]').forEach(btn => btn.addEventListener("click", async () => {
+    const id = btn.closest("[data-care]").dataset.care;
+    if (!await confirmBox("Delete this entry?")) return;
+    try {
+      await api(`care/${id}`, { method: "DELETE" });
+      toast("Entry deleted");
+      await viewPlant(p.number);
+    } catch (err) { toast(err.message, true); }
+  }));
+}
+
+async function viewRound() {
+  setBar("Water round", "#/");
+  const data = await api("overview");
+  const row = p => `<div class="round-row" data-number="${p.number}">
+      <div class="round-info">
+        <div><span class="n">${p.number}</span> ${esc(p.name)}</div>
+        <div class="muted small">${p.watering_rule ? esc(p.watering_rule) + " · " : ""}${p.last_watered ? "watered " + esc(ago(p.last_watered)) : "not logged yet"}</div>
+      </div>
+      <div class="seg" role="group" aria-label="Plant ${p.number}">
+        <button type="button" data-kind="checked">Moist</button>
+        <button type="button" data-kind="watered">Watered</button>
+      </div>
+      <label class="check feed" hidden><input type="checkbox"> feed</label>
+    </div>`;
+  let html = `<p class="muted" style="margin:4px 0 0">Tap <strong>Watered</strong> or <strong>Moist</strong> (checked, didn't need water) for each plant you looked at. Leave the rest blank. Tap again to clear.</p>`;
+  for (const a of data.areas) {
+    const plants = a.spots.flatMap(s => s.plants);
+    if (!plants.length) continue;
+    html += `<section class="area"><h2>${esc(a.name)}</h2>`;
+    for (const s of a.spots.filter(s => s.plants.length)) {
+      html += `<div class="spot"><h3>${esc(s.name)}</h3><div class="list">${s.plants.map(row).join("")}</div></div>`;
+    }
+    html += `</section>`;
+  }
+  if (data.unplaced.length) html += `<section class="area"><h2>No location</h2><div class="list">${data.unplaced.map(row).join("")}</div></section>`;
+  html += `<div class="round-save"><span class="muted" id="round-count">Nothing marked yet</span>
+    <button class="btn primary" id="round-save" disabled>Save</button></div>`;
+  view.innerHTML = html;
+
+  const state = new Map();
+  const count = () => {
+    const vals = [...state.values()];
+    const w = vals.filter(v => v === "watered").length, c = vals.length - w;
+    document.getElementById("round-count").textContent = vals.length ? `${w} watered · ${c} moist` : "Nothing marked yet";
+    document.getElementById("round-save").disabled = !vals.length;
+  };
+  view.querySelectorAll(".round-row").forEach(r => {
+    const n = Number(r.dataset.number);
+    const feed = r.querySelector(".feed");
+    r.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => {
+      const kind = state.get(n) === b.dataset.kind ? null : b.dataset.kind;
+      if (kind) state.set(n, kind); else state.delete(n);
+      r.querySelectorAll(".seg button").forEach(x => x.classList.toggle("on", x.dataset.kind === kind));
+      feed.hidden = kind !== "watered";
+      if (kind !== "watered") feed.querySelector("input").checked = false;
+      count();
+    }));
+  });
+  document.getElementById("round-save").addEventListener("click", async e => {
+    const entries = [...state.entries()].map(([number, kind]) => ({
+      number, kind,
+      fed: kind === "watered" && view.querySelector(`.round-row[data-number="${number}"] .feed input`).checked,
+    }));
+    e.target.disabled = true;
+    e.target.textContent = "Saving…";
+    try {
+      const res = await api("round", { json: { entries } });
+      toast(`Saved: ${res.watered} watered, ${res.checked} moist`);
+      location.hash = "#/";
+    } catch (err) {
+      toast(err.message, true);
+      e.target.disabled = false;
+      e.target.textContent = "Save";
+    }
+  });
 }
 
 async function viewPhoto(number) {
@@ -495,6 +617,7 @@ async function route() {
     if ((m = h.match(/^#\/plant\/(\d+)\/edit$/))) await viewEdit(Number(m[1]));
     else if ((m = h.match(/^#\/plant\/(\d+)$/))) await viewPlant(Number(m[1]));
     else if (h === "#/new") await viewEdit(null);
+    else if (h === "#/round") await viewRound();
     else if ((m = h.match(/^#\/photo(?:\/(\d+))?$/))) await viewPhoto(m[1] ? Number(m[1]) : null);
     else if (h === "#/settings") await viewSettings();
     else await viewHome();

@@ -4,14 +4,18 @@ One HA device per plant ("Plant 7 – Parlour palm") with:
   camera.plant_7               latest photo (~1024 px), photo details as attributes
   sensor.plant_7_last_photo    when the latest photo was taken
   sensor.plant_7_location      area › spot · position
+  sensor.plant_7_last_watered / _last_fed / _next_check
+  button.plant_7_watered       logs a watering from HA
 Everything is published retained, so HA gets it back after a restart.
 """
 
 import json
 import logging
 import os
+import re
 import threading
 import urllib.request
+from datetime import datetime
 
 import paho.mqtt.client as mqtt
 
@@ -61,8 +65,10 @@ def _broker_settings() -> dict | None:
 
 
 class Publisher:
-    def __init__(self, version: str):
+    def __init__(self, version: str, next_check_fn=None):
         self.version = version
+        self.next_check_fn = next_check_fn
+        self.on_watered = None  # set by the app: called with the plant number
         self.client = None
         self.state = "not started"
         self.last_error = None
@@ -87,6 +93,7 @@ class Publisher:
         c.will_set(STATUS_TOPIC, "offline", qos=1, retain=True)
         c.on_connect = self._on_connect
         c.on_disconnect = self._on_disconnect
+        c.on_message = self._on_message
         c.reconnect_delay_set(min_delay=2, max_delay=60)
         self.client = c
         self.state = "connecting"
@@ -107,6 +114,7 @@ class Publisher:
         self.state, self.last_error = "connected", None
         log.info("MQTT connected")
         client.publish(STATUS_TOPIC, "online", qos=1, retain=True)
+        client.subscribe(f"{BASE}/plant/+/watered/set", qos=1)
         # Publishing all plants renders 20+ images, so keep it off the network thread.
         threading.Thread(target=self.publish_all, daemon=True).start()
 
@@ -114,6 +122,21 @@ class Publisher:
         self.state = "disconnected"
         if reason_code and reason_code.is_failure:
             self.last_error = str(reason_code)
+
+    def _on_message(self, client, userdata, msg):
+        m = re.fullmatch(rf"{BASE}/plant/(\d+)/watered/set", msg.topic)
+        if not m or msg.retain or not self.on_watered:
+            return
+        try:
+            self.on_watered(int(m.group(1)))
+            log.info("Plant %s watered (from Home Assistant)", m.group(1))
+        except Exception:
+            log.exception("Couldn't log the watering for plant %s", m.group(1))
+
+    def _next_check(self):
+        if not self.next_check_fn:
+            return None
+        return datetime.fromisoformat(self.next_check_fn()).astimezone().isoformat(timespec="seconds")
 
     @property
     def connected(self) -> bool:
@@ -150,7 +173,11 @@ class Publisher:
             self._pub(_topic(number, "state"), json.dumps({
                 "last_photo": latest["taken_at"] if latest else None,
                 "location": p["location"],
-            }))
+                "last_watered": p["last_watered"],
+                "last_checked": p["last_checked"],
+                "last_fed": p["last_fed"],
+                "next_check": self._next_check(),
+            }, ensure_ascii=False))
             self._pub(_topic(number, "attributes"), json.dumps({
                 "plant_number": p["number"],
                 "plant_name": p["name"],
@@ -160,6 +187,9 @@ class Publisher:
                 "taken_at": latest["taken_at"] if latest else None,
                 "note": latest["note"] if latest else None,
                 "photo_count": len(p["photos"]),
+                "watering_rule": p["watering_rule"],
+                "last_watered": p["last_watered"],
+                "last_checked": p["last_checked"],
             }, ensure_ascii=False))
             if image:
                 # An empty retained message clears the photo when the plant has none.
@@ -210,6 +240,49 @@ class Publisher:
                     "icon": "mdi:camera-outline",
                     "state_topic": _topic(n, "state"),
                     "value_template": "{{ value_json.last_photo }}",
+                    **avail,
+                },
+                "last_watered": {
+                    "platform": "sensor",
+                    "name": "Last watered",
+                    "unique_id": f"{uid}_last_watered",
+                    "default_entity_id": f"sensor.plant_{n}_last_watered",
+                    "device_class": "timestamp",
+                    "icon": "mdi:watering-can-outline",
+                    "state_topic": _topic(n, "state"),
+                    "value_template": "{{ value_json.last_watered }}",
+                    **avail,
+                },
+                "last_fed": {
+                    "platform": "sensor",
+                    "name": "Last fed",
+                    "unique_id": f"{uid}_last_fed",
+                    "default_entity_id": f"sensor.plant_{n}_last_fed",
+                    "device_class": "timestamp",
+                    "icon": "mdi:flask-outline",
+                    "state_topic": _topic(n, "state"),
+                    "value_template": "{{ value_json.last_fed }}",
+                    **avail,
+                },
+                "next_check": {
+                    "platform": "sensor",
+                    "name": "Next check",
+                    "unique_id": f"{uid}_next_check",
+                    "default_entity_id": f"sensor.plant_{n}_next_check",
+                    "device_class": "timestamp",
+                    "icon": "mdi:calendar-check-outline",
+                    "state_topic": _topic(n, "state"),
+                    "value_template": "{{ value_json.next_check }}",
+                    **avail,
+                },
+                "watered": {
+                    "platform": "button",
+                    "name": "Watered",
+                    "unique_id": f"{uid}_watered",
+                    "default_entity_id": f"button.plant_{n}_watered",
+                    "icon": "mdi:watering-can",
+                    "command_topic": f"{BASE}/plant/{n}/watered/set",
+                    "payload_press": "PRESS",
                     **avail,
                 },
                 "location": {

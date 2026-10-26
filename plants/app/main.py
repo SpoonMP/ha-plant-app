@@ -51,9 +51,19 @@ log = logging.getLogger("plants")
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
-mqtt = Publisher(VERSION)
+mqtt = Publisher(VERSION, lambda: next_check()["at"])
+
+
+def _watered_from_ha(number: int) -> None:
+    """The plant's Watered button was pressed in Home Assistant (runs on the MQTT thread)."""
+    with db.session() as con:
+        db.add_care(con, number, "watered", source="ha")
+    mqtt.publish_plant(number, image=False)
+
+
+mqtt.on_watered = _watered_from_ha
 
 # Only the Supervisor's ingress proxy may talk to the app (plus localhost for testing).
 ALLOWED_CLIENTS = {"172.30.32.2", "127.0.0.1", "::1"}
@@ -198,6 +208,56 @@ async def api_plants_create(request):
         p = db.get_plant(con, number)
     await publish(number)
     return ok(p, 201)
+
+
+# ---------- API: watering ----------
+
+def _care_entry(data: dict) -> tuple[str, bool, str]:
+    kind = str(data.get("kind") or "watered")
+    fed = bool(data.get("fed"))
+    note = str(data.get("note") or "")
+    return kind, fed, note
+
+
+@handle
+async def api_care_add(request):
+    number = int(request.path_params["number"])
+    kind, fed, note = _care_entry(await body(request))
+    with db.session() as con:
+        care_id = db.add_care(con, number, kind, fed, note)
+        p = db.get_plant(con, number)
+    await publish(number, image=False)
+    return ok({"id": care_id, "plant": p}, 201)
+
+
+@handle
+async def api_care_delete(request):
+    care_id = int(request.path_params["id"])
+    with db.session() as con:
+        number = db.delete_care(con, care_id)
+    await publish(number, image=False)
+    return ok()
+
+
+@handle
+async def api_round(request):
+    """Water round: several plants logged in one go, all with the same time."""
+    data = await body(request)
+    entries = data.get("entries") or []
+    if not entries:
+        raise db.UserError("Nothing ticked yet.")
+    at = db.now_iso()
+    numbers = []
+    with db.session() as con:
+        for e in entries:
+            number = int(e.get("number"))
+            kind, fed, note = _care_entry(e)
+            db.add_care(con, number, kind, fed, note, source="round", at=at)
+            numbers.append(number)
+    for n in numbers:
+        await publish(n, image=False)
+    watered = sum(1 for e in entries if (e.get("kind") or "watered") == "watered")
+    return ok({"watered": watered, "checked": len(entries) - watered}, 201)
 
 
 # ---------- API: photos ----------
@@ -406,14 +466,23 @@ async def retention_loop():
         await asyncio.sleep((nxt - now).total_seconds())
 
 
+async def next_check_loop():
+    """When a check time passes, re-send every plant so HA's Next check moves on."""
+    while True:
+        when = datetime.fromisoformat(next_check()["at"])
+        await asyncio.sleep(max(1.0, (when - datetime.now()).total_seconds() + 60))
+        await publish_all(image=False)
+
+
 @asynccontextmanager
 async def lifespan(app):
     db.init_db()
     os.makedirs(photos.PHOTO_DIR, exist_ok=True)
     mqtt.start()
-    task = asyncio.create_task(retention_loop())
+    tasks = [asyncio.create_task(retention_loop()), asyncio.create_task(next_check_loop())]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
     mqtt.stop()
 
 
@@ -425,6 +494,9 @@ routes = [
     Route("/api/plants", api_plants_create, methods=["POST"]),
     Route("/api/plants/{number:int}", api_plant, methods=["GET", "PUT", "DELETE"]),
     Route("/api/plants/{number:int}/photos", api_photo_upload, methods=["POST"]),
+    Route("/api/plants/{number:int}/care", api_care_add, methods=["POST"]),
+    Route("/api/care/{id:int}", api_care_delete, methods=["DELETE"]),
+    Route("/api/round", api_round, methods=["POST"]),
     Route("/api/photos/{id:int}", api_photo, methods=["GET", "PUT", "DELETE"]),
     Route("/api/photos/{id:int}/{size:str}", api_photo_file),
     Route("/api/locations", api_locations),

@@ -140,6 +140,31 @@ main { max-width: 900px; margin: 0 auto; padding: 12px 16px 48px; }
 label.btn { margin: 0; font-size: 15px; }
 .hint-line { font-size: 13px; margin: 6px 0 0; }
 
+/* watering */
+.home-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: space-between; }
+.home-head .summary { margin: 8px 0; }
+.chip + .chip { margin-left: 0; }
+.care-actions { align-items: center; margin-top: 8px; }
+.check { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; margin: 0; min-height: 44px; }
+.check input { width: 20px; height: 20px; accent-color: var(--accent); }
+.log.care li { display: flex; align-items: center; gap: 8px; }
+.log.care .grow { flex: 1; min-width: 0; }
+.btn.small-x { min-height: 32px; width: 32px; font-size: 13px; color: var(--ink-2); }
+.round-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 12px; border-top: 1px solid var(--line); }
+.round-row:first-child { border-top: 0; }
+.round-info { flex: 1 1 160px; min-width: 0; }
+.round-info .n { display: inline-block; min-width: 24px; font-weight: 700; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.small { font-size: 13px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.seg button { min-height: 40px; padding: 0 12px; border: 0; background: var(--surface); color: var(--ink); font: inherit; font-weight: 600; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.on[data-kind="watered"] { background: var(--accent); color: var(--accent-ink); }
+.seg button.on[data-kind="checked"] { background: var(--chip); }
+.round-save {
+  position: sticky; bottom: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  margin: 18px -16px 0; padding: 12px 16px; background: var(--bg); border-top: 1px solid var(--line);
+}
+
 /* buttons & forms */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
