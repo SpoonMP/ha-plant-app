@@ -3,7 +3,8 @@ FROM ghcr.io/home-assistant/base-python:3.13-alpine3.24
 
 WORKDIR /app
 
-# All packages are pure Python, so nothing has to be compiled on the Pi.
+# Starlette, uvicorn, python-multipart and paho-mqtt are pure Python; Pillow has a
+# ready-made build for the Pi (musllinux aarch64), so nothing is compiled on install.
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --break-system-packages -r /app/requirements.txt
 

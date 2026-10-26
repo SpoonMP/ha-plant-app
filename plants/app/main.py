@@ -5,7 +5,9 @@ Served inside Home Assistant through ingress: Home Assistant handles login and
 All page and API paths are relative so they work under the ingress URL.
 """
 
+import asyncio
 import json
+import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -34,17 +36,24 @@ _load_container_env()
 from datetime import datetime, timedelta
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import db
+from . import db, photos
+from .publisher import Publisher
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("plants")
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.1.3"
+VERSION = "0.2.0"
+
+mqtt = Publisher(VERSION)
 
 # Only the Supervisor's ingress proxy may talk to the app (plus localhost for testing).
 ALLOWED_CLIENTS = {"172.30.32.2", "127.0.0.1", "::1"}
@@ -52,6 +61,11 @@ ALLOWED_CLIENTS = {"172.30.32.2", "127.0.0.1", "::1"}
 # Fixed check times from the existing Home Assistant reminders:
 # Water check Wednesday 19:00, Plant check Sunday 15:00 (weekday: Mon=0).
 CHECK_TIMES = [(2, 19, 0, "Water check"), (6, 15, 0, "Plant check")]
+
+# Photo retention runs at this time every night.
+RETENTION_AT = (3, 30)
+
+IMAGE_CACHE = {"Cache-Control": "private, max-age=31536000, immutable"}
 
 
 def next_check(now: datetime | None = None) -> dict:
@@ -108,6 +122,21 @@ def handle(fn):
     return wrapper
 
 
+async def publish(number: int, image: bool = True) -> None:
+    """Update a plant in Home Assistant; never fails the request if MQTT is down."""
+    try:
+        await run_in_threadpool(mqtt.publish_plant, number, image)
+    except Exception:
+        log.exception("Couldn't publish plant %s", number)
+
+
+async def publish_all(image: bool = False) -> None:
+    try:
+        await run_in_threadpool(mqtt.publish_all, image)
+    except Exception:
+        log.exception("Couldn't publish the plants")
+
+
 # ---------- pages ----------
 
 async def index(request: Request):
@@ -117,7 +146,7 @@ async def index(request: Request):
     )
 
 
-# ---------- API ----------
+# ---------- API: plants ----------
 
 @handle
 async def api_overview(request):
@@ -131,26 +160,108 @@ async def api_overview(request):
 @handle
 async def api_plant(request):
     number = int(request.path_params["number"])
-    with db.session() as con:
-        if request.method == "GET":
+    if request.method == "GET":
+        with db.session() as con:
             p = db.get_plant(con, number)
-            p["next_check"] = next_check()
-            return ok(p)
-        if request.method == "PUT":
-            db.update_plant(con, number, await body(request))
-            return ok(db.get_plant(con, number))
-        if request.method == "DELETE":
+        p["next_check"] = next_check()
+        return ok(p)
+    if request.method == "PUT":
+        data = await body(request)
+        with db.session() as con:
+            db.update_plant(con, number, data)
+            p = db.get_plant(con, number)
+        await publish(number, image=False)
+        return ok(p)
+    if request.method == "DELETE":
+        with db.session() as con:
             db.delete_plant(con, number)
-            return ok()
+        photos.remove_plant_files(number)
+        await run_in_threadpool(mqtt.remove_plant, number)
+        return ok()
     raise HTTPException(405)
 
 
 @handle
 async def api_plants_create(request):
+    data = await body(request)
     with db.session() as con:
-        number = db.create_plant(con, await body(request))
-        return ok(db.get_plant(con, number), 201)
+        number = db.create_plant(con, data)
+        p = db.get_plant(con, number)
+    await publish(number)
+    return ok(p, 201)
 
+
+# ---------- API: photos ----------
+
+@handle
+async def api_photo_upload(request):
+    number = int(request.path_params["number"])
+    with db.session() as con:
+        db.get_plant(con, number)  # 404 if the plant doesn't exist
+    form = await request.form(max_files=1)
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        raise db.UserError("No photo was sent.")
+    raw = await upload.read()
+    note = str(form.get("note") or "")[:500]
+    hint = form.get("taken_hint")
+    # Decoding and resizing takes a second or two on the Pi: keep it off the event loop.
+    processed = await run_in_threadpool(photos.process_upload, raw, hint)
+    with db.session() as con:
+        photo_id = db.add_photo(con, number, processed["taken_at"], note, 0, 0, 0)
+        try:
+            w, h, size = await run_in_threadpool(photos.store, number, photo_id, processed["image"])
+        except Exception:
+            photos.remove_files(number, photo_id)
+            raise
+        con.execute("UPDATE photos SET width=?, height=?, bytes=? WHERE id=?", (w, h, size, photo_id))
+        photo = db.get_photo(con, photo_id)
+    await publish(number)
+    return ok(photo, 201)
+
+
+@handle
+async def api_photo(request):
+    photo_id = int(request.path_params["id"])
+    if request.method == "DELETE":
+        with db.session() as con:
+            p = db.delete_photo(con, photo_id)
+        photos.remove_files(p["plant_number"], photo_id)
+        await publish(p["plant_number"])
+        return ok()
+    if request.method == "PUT":
+        data = await body(request)
+        with db.session() as con:
+            p = db.get_photo(con, photo_id)
+            con.execute("UPDATE photos SET note=? WHERE id=?", (str(data.get("note") or "").strip()[:500], photo_id))
+        await publish(p["plant_number"], image=False)
+        return ok()
+    with db.session() as con:
+        return ok(db.get_photo(con, photo_id))
+
+
+@handle
+async def api_photo_file(request):
+    photo_id = int(request.path_params["id"])
+    size = request.path_params["size"]
+    with db.session() as con:
+        p = db.get_photo(con, photo_id)
+    n = p["plant_number"]
+    if size == "full":
+        path = photos.full_path(n, photo_id)
+    elif size == "thumb":
+        path = photos.thumb_path(n, photo_id)
+    elif size == "camera":
+        data = await run_in_threadpool(photos.camera_jpeg, n, photo_id)
+        return Response(data, media_type="image/jpeg", headers=IMAGE_CACHE)
+    else:
+        raise KeyError(size)
+    if not os.path.exists(path):
+        raise KeyError(photo_id)
+    return FileResponse(path, media_type="image/jpeg", headers=IMAGE_CACHE)
+
+
+# ---------- API: areas & spots ----------
 
 @handle
 async def api_locations(request):
@@ -168,17 +279,20 @@ async def api_areas_create(request):
 @handle
 async def api_area(request):
     area_id = int(request.path_params["id"])
-    with db.session() as con:
-        if request.method == "PUT":
-            data = await body(request)
+    if request.method == "PUT":
+        data = await body(request)
+        with db.session() as con:
             if "move" in data:
                 db.move(con, "areas", area_id, int(data["move"]))
             if "name" in data:
                 db.rename_area(con, area_id, data["name"])
-            return ok()
-        if request.method == "DELETE":
+        if "name" in data:
+            await publish_all()  # location text changes
+        return ok()
+    if request.method == "DELETE":
+        with db.session() as con:
             db.delete_area(con, area_id)
-            return ok()
+        return ok()
     raise HTTPException(405)
 
 
@@ -192,19 +306,24 @@ async def api_spots_create(request):
 @handle
 async def api_spot(request):
     spot_id = int(request.path_params["id"])
-    with db.session() as con:
-        if request.method == "PUT":
-            data = await body(request)
+    if request.method == "PUT":
+        data = await body(request)
+        with db.session() as con:
             if "move" in data:
                 db.move(con, "spots", spot_id, int(data["move"]))
             if "name" in data:
                 db.rename_spot(con, spot_id, data["name"])
-            return ok()
-        if request.method == "DELETE":
+        if "name" in data:
+            await publish_all()
+        return ok()
+    if request.method == "DELETE":
+        with db.session() as con:
             db.delete_spot(con, spot_id)
-            return ok()
+        return ok()
     raise HTTPException(405)
 
+
+# ---------- API: import / export / health ----------
 
 @handle
 async def api_export(request):
@@ -234,10 +353,20 @@ async def api_import(request):
         raise db.UserError(f"That isn't valid JSON (line {e.lineno}).")
     with db.session() as con:
         result = db.import_all(con, data)
+    await publish_all(image=True)
     return ok(result)
 
 
+@handle
+async def api_publish(request):
+    """Re-send every plant to Home Assistant (photos included)."""
+    await publish_all(image=True)
+    return ok({"mqtt": mqtt.status()})
+
+
 async def api_health(request):
+    with db.session() as con:
+        stats = db.photo_stats(con)
     return ok({
         "ok": True,
         "version": VERSION,
@@ -245,21 +374,50 @@ async def api_health(request):
         "db_exists": os.path.exists(db.DB_PATH),
         "tz": os.environ.get("TZ"),
         "local_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "photos": stats,
+        "mqtt": mqtt.status(),
     })
+
+
+# ---------- background ----------
+
+async def retention_loop():
+    """Thin out old photos once at start-up, then every night."""
+    while True:
+        try:
+            removed = await run_in_threadpool(photos.apply_retention)
+            if removed:
+                log.info("Photo retention removed %s old photos", removed)
+        except Exception:
+            log.exception("Photo retention failed")
+        now = datetime.now()
+        nxt = now.replace(hour=RETENTION_AT[0], minute=RETENTION_AT[1], second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        await asyncio.sleep((nxt - now).total_seconds())
 
 
 @asynccontextmanager
 async def lifespan(app):
     db.init_db()
+    os.makedirs(photos.PHOTO_DIR, exist_ok=True)
+    mqtt.start()
+    task = asyncio.create_task(retention_loop())
     yield
+    task.cancel()
+    mqtt.stop()
 
 
 routes = [
     Route("/", index),
     Route("/api/health", api_health),
     Route("/api/overview", api_overview),
+    Route("/api/publish", api_publish, methods=["POST"]),
     Route("/api/plants", api_plants_create, methods=["POST"]),
     Route("/api/plants/{number:int}", api_plant, methods=["GET", "PUT", "DELETE"]),
+    Route("/api/plants/{number:int}/photos", api_photo_upload, methods=["POST"]),
+    Route("/api/photos/{id:int}", api_photo, methods=["GET", "PUT", "DELETE"]),
+    Route("/api/photos/{id:int}/{size:str}", api_photo_file),
     Route("/api/locations", api_locations),
     Route("/api/areas", api_areas_create, methods=["POST"]),
     Route("/api/areas/{id:int}", api_area, methods=["PUT", "DELETE"]),

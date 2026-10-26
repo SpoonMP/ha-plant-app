@@ -12,7 +12,7 @@ from datetime import datetime
 DATA_DIR = os.environ.get("PLANTS_DATA_DIR", "/data").strip()
 DB_PATH = os.path.join(DATA_DIR, "plants.db")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -52,6 +52,17 @@ CREATE TABLE IF NOT EXISTS location_log (
     from_text    TEXT NOT NULL,
     to_text      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS photos (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_number INTEGER NOT NULL REFERENCES plants(number) ON DELETE CASCADE,
+    taken_at     TEXT NOT NULL,
+    uploaded_at  TEXT NOT NULL,
+    note         TEXT NOT NULL DEFAULT '',
+    width        INTEGER NOT NULL,
+    height       INTEGER NOT NULL,
+    bytes        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS photos_by_plant ON photos (plant_number, taken_at);
 """
 
 PLANT_TEXT_FIELDS = (
@@ -91,6 +102,10 @@ def init_db() -> None:
         con.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
+        )
+        con.execute(
+            "UPDATE meta SET value=? WHERE key='schema_version' AND CAST(value AS INTEGER) < ?",
+            (str(SCHEMA_VERSION), SCHEMA_VERSION),
         )
         # Highest plant number ever used, so numbers of removed plants are never reused.
         con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('max_number', '0')")
@@ -141,6 +156,11 @@ def plant_dict(con, row) -> dict:
     d["area_id"] = loc["area_id"] if loc else None
     d["spot"] = loc["spot"] if loc else None
     d["location"] = location_text(con, d["spot_id"], d["position"])
+    latest = latest_photo(con, d["number"])
+    d["latest_photo"] = {"id": latest["id"], "taken_at": latest["taken_at"]} if latest else None
+    d["photo_count"] = con.execute(
+        "SELECT COUNT(*) FROM photos WHERE plant_number=?", (d["number"],)
+    ).fetchone()[0]
     return d
 
 
@@ -176,6 +196,7 @@ def get_plant(con, number: int) -> dict:
             (number,),
         )
     ]
+    d["photos"] = list_photos(con, number)
     return d
 
 
@@ -255,6 +276,77 @@ def delete_plant(con, number: int) -> None:
     cur = con.execute("DELETE FROM plants WHERE number=?", (number,))
     if cur.rowcount == 0:
         raise KeyError(number)
+
+
+# ---------- photos ----------
+
+PHOTO_FIELDS = "id, plant_number, taken_at, uploaded_at, note, width, height, bytes"
+
+
+def list_photos(con, number: int) -> list:
+    """All photos of a plant, newest first."""
+    return [dict(r) for r in con.execute(
+        f"SELECT {PHOTO_FIELDS} FROM photos WHERE plant_number=? ORDER BY taken_at DESC, id DESC",
+        (number,),
+    )]
+
+
+def latest_photo(con, number: int):
+    row = con.execute(
+        f"SELECT {PHOTO_FIELDS} FROM photos WHERE plant_number=? ORDER BY taken_at DESC, id DESC LIMIT 1",
+        (number,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_photo(con, photo_id: int) -> dict:
+    row = con.execute(f"SELECT {PHOTO_FIELDS} FROM photos WHERE id=?", (photo_id,)).fetchone()
+    if not row:
+        raise KeyError(photo_id)
+    return dict(row)
+
+
+def add_photo(con, number: int, taken_at: str, note: str, width: int, height: int, size: int) -> int:
+    if not con.execute("SELECT 1 FROM plants WHERE number=?", (number,)).fetchone():
+        raise KeyError(number)
+    return con.execute(
+        "INSERT INTO photos (plant_number, taken_at, uploaded_at, note, width, height, bytes) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (number, taken_at, now_iso(), (note or "").strip(), width, height, size),
+    ).lastrowid
+
+
+def delete_photo(con, photo_id: int) -> dict:
+    p = get_photo(con, photo_id)
+    con.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+    return p
+
+
+def photos_to_thin(con, cutoff_iso: str) -> list:
+    """Photos older than the cutoff that retention removes: per plant and calendar
+    month, only the newest photo is kept."""
+    rows = con.execute(
+        "SELECT id, plant_number, taken_at FROM photos WHERE taken_at < ? "
+        "ORDER BY plant_number, taken_at DESC, id DESC",
+        (cutoff_iso,),
+    ).fetchall()
+    seen, remove = set(), []
+    for r in rows:
+        key = (r["plant_number"], r["taken_at"][:7])
+        if key in seen:
+            remove.append(r["id"])
+        else:
+            seen.add(key)
+    return remove
+
+
+def photo_stats(con) -> dict:
+    count, size = con.execute("SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM photos").fetchone()
+    return {"count": count, "megabytes": round(size / 1_000_000, 1)}
+
+
+def plant_numbers(con) -> list:
+    return [r[0] for r in con.execute("SELECT number FROM plants ORDER BY number")]
 
 
 # ---------- area / spot writes ----------

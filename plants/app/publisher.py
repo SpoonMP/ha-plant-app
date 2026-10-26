@@ -1,0 +1,230 @@
+"""Publishes each plant to Home Assistant through Mosquitto (MQTT discovery).
+
+One HA device per plant ("Plant 7 – Parlour palm") with:
+  camera.plant_7               latest photo (~1024 px), photo details as attributes
+  sensor.plant_7_last_photo    when the latest photo was taken
+  sensor.plant_7_location      area › spot · position
+Everything is published retained, so HA gets it back after a restart.
+"""
+
+import json
+import logging
+import os
+import threading
+import urllib.request
+
+import paho.mqtt.client as mqtt
+
+from . import db, photos
+
+log = logging.getLogger("plants.mqtt")
+
+BASE = "plants_app"
+STATUS_TOPIC = f"{BASE}/status"
+REPO_URL = "https://github.com/SpoonMP/ha-plant-app"
+
+
+def _topic(number: int, kind: str) -> str:
+    return f"{BASE}/plant/{number}/{kind}"
+
+
+def _config_topic(number: int) -> str:
+    return f"homeassistant/device/{BASE}_plant_{number}/config"
+
+
+def _broker_settings() -> dict | None:
+    """Mosquitto's address and login, from the Supervisor (or env vars when testing)."""
+    if os.environ.get("PLANTS_MQTT_HOST"):
+        return {
+            "host": os.environ["PLANTS_MQTT_HOST"],
+            "port": int(os.environ.get("PLANTS_MQTT_PORT", "1883")),
+            "username": os.environ.get("PLANTS_MQTT_USER"),
+            "password": os.environ.get("PLANTS_MQTT_PASSWORD"),
+        }
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        return None
+    req = urllib.request.Request(
+        "http://supervisor/services/mqtt",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as res:
+        data = json.load(res).get("data") or {}
+    if not data.get("host"):
+        return None
+    return {
+        "host": data["host"],
+        "port": int(data.get("port", 1883)),
+        "username": data.get("username"),
+        "password": data.get("password"),
+    }
+
+
+class Publisher:
+    def __init__(self, version: str):
+        self.version = version
+        self.client = None
+        self.state = "not started"
+        self.last_error = None
+        self._lock = threading.Lock()
+
+    # ---------- connection ----------
+
+    def start(self) -> None:
+        try:
+            settings = _broker_settings()
+        except Exception as e:  # Supervisor not reachable or Mosquitto not installed
+            self.state, self.last_error = "no broker", str(e)
+            log.warning("MQTT not available: %s", e)
+            return
+        if not settings:
+            self.state = "no broker"
+            log.warning("MQTT not available: no Mosquitto service found")
+            return
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="plants-app")
+        if settings.get("username"):
+            c.username_pw_set(settings["username"], settings.get("password"))
+        c.will_set(STATUS_TOPIC, "offline", qos=1, retain=True)
+        c.on_connect = self._on_connect
+        c.on_disconnect = self._on_disconnect
+        c.reconnect_delay_set(min_delay=2, max_delay=60)
+        self.client = c
+        self.state = "connecting"
+        c.connect_async(settings["host"], settings["port"], keepalive=60)
+        c.loop_start()
+
+    def stop(self) -> None:
+        if self.client:
+            self.client.publish(STATUS_TOPIC, "offline", qos=1, retain=True).wait_for_publish(2)
+            self.client.disconnect()
+            self.client.loop_stop()
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if reason_code.is_failure:
+            self.state, self.last_error = "refused", str(reason_code)
+            log.warning("MQTT connection refused: %s", reason_code)
+            return
+        self.state, self.last_error = "connected", None
+        log.info("MQTT connected")
+        client.publish(STATUS_TOPIC, "online", qos=1, retain=True)
+        # Publishing all plants renders 20+ images, so keep it off the network thread.
+        threading.Thread(target=self.publish_all, daemon=True).start()
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        self.state = "disconnected"
+        if reason_code and reason_code.is_failure:
+            self.last_error = str(reason_code)
+
+    @property
+    def connected(self) -> bool:
+        return self.client is not None and self.client.is_connected()
+
+    def _pub(self, topic: str, payload, retain: bool = True) -> None:
+        self.client.publish(topic, payload, qos=1, retain=retain)
+
+    # ---------- plants ----------
+
+    def publish_all(self, image: bool = True) -> None:
+        if not self.connected:
+            return
+        with db.session() as con:
+            numbers = db.plant_numbers(con)
+        for n in numbers:
+            try:
+                self.publish_plant(n, image)
+            except Exception:
+                log.exception("Couldn't publish plant %s", n)
+
+    def publish_plant(self, number: int, image: bool = True) -> None:
+        """Send a plant's device config, state and (optionally) its latest photo."""
+        if not self.connected:
+            return
+        with db.session() as con:
+            try:
+                p = db.get_plant(con, number)
+            except KeyError:
+                return self.remove_plant(number)
+        latest = p["photos"][0] if p["photos"] else None
+        with self._lock:
+            self._pub(_config_topic(number), json.dumps(self._discovery(p)))
+            self._pub(_topic(number, "state"), json.dumps({
+                "last_photo": latest["taken_at"] if latest else None,
+                "location": p["location"],
+            }))
+            self._pub(_topic(number, "attributes"), json.dumps({
+                "plant_number": p["number"],
+                "plant_name": p["name"],
+                "species": p["species"],
+                "location": p["location"],
+                "photo_id": latest["id"] if latest else None,
+                "taken_at": latest["taken_at"] if latest else None,
+                "note": latest["note"] if latest else None,
+                "photo_count": len(p["photos"]),
+            }, ensure_ascii=False))
+            if image:
+                # An empty retained message clears the photo when the plant has none.
+                payload = photos.camera_jpeg(number, latest["id"]) if latest else b""
+                self._pub(_topic(number, "photo"), payload)
+
+    def remove_plant(self, number: int) -> None:
+        """Remove a plant's device and entities from HA."""
+        if not self.connected:
+            return
+        with self._lock:
+            for topic in (_config_topic(number), _topic(number, "state"),
+                          _topic(number, "attributes"), _topic(number, "photo")):
+                self._pub(topic, b"")
+
+    def _discovery(self, p: dict) -> dict:
+        n = p["number"]
+        uid = f"{BASE}_plant_{n}"
+        avail = {"availability_topic": STATUS_TOPIC}
+        device = {
+            "identifiers": [uid],
+            "name": f"Plant {n} – {p['name']}",
+            "manufacturer": "Plants app",
+            "model": p["species"] or "Plant",
+            "sw_version": self.version,
+        }
+        if p.get("area"):
+            device["suggested_area"] = p["area"]
+        return {
+            "device": device,
+            "origin": {"name": "Plants app", "sw_version": self.version, "support_url": REPO_URL},
+            "components": {
+                "photo": {
+                    "platform": "camera",
+                    "name": "Photo",
+                    "unique_id": f"{uid}_photo",
+                    "default_entity_id": f"camera.plant_{n}",
+                    "topic": _topic(n, "photo"),
+                    "json_attributes_topic": _topic(n, "attributes"),
+                    **avail,
+                },
+                "last_photo": {
+                    "platform": "sensor",
+                    "name": "Last photo",
+                    "unique_id": f"{uid}_last_photo",
+                    "default_entity_id": f"sensor.plant_{n}_last_photo",
+                    "device_class": "timestamp",
+                    "icon": "mdi:camera-outline",
+                    "state_topic": _topic(n, "state"),
+                    "value_template": "{{ value_json.last_photo }}",
+                    **avail,
+                },
+                "location": {
+                    "platform": "sensor",
+                    "name": "Location",
+                    "unique_id": f"{uid}_location",
+                    "default_entity_id": f"sensor.plant_{n}_location",
+                    "icon": "mdi:map-marker-outline",
+                    "state_topic": _topic(n, "state"),
+                    "value_template": "{{ value_json.location }}",
+                    **avail,
+                },
+            },
+            "qos": 1,
+        }
+
+    def status(self) -> dict:
+        return {"state": self.state, "connected": self.connected, "error": self.last_error}

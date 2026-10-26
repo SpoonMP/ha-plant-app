@@ -5,6 +5,10 @@ const view = document.getElementById("view");
 const titleEl = document.getElementById("title");
 const backEl = document.getElementById("back");
 const settingsLink = document.getElementById("settings-link");
+const photoLink = document.getElementById("photo-link");
+
+// A photo picked on the plant page, handed to the photo screen.
+let pendingPhoto = null;
 
 const LEAF = '<svg viewBox="0 0 100 100" aria-hidden="true"><path d="M90 10C45 10 12 35 12 72c0 6 1 11 3 16 4-20 18-38 40-50-18 15-29 32-33 52 6 2 12 2 18 2 37 0 50-40 50-82z"/></svg>';
 
@@ -68,6 +72,7 @@ function setBar(title, backHref) {
   backEl.hidden = !backHref;
   if (backHref) backEl.setAttribute("href", backHref);
   settingsLink.hidden = location.hash.startsWith("#/settings");
+  photoLink.hidden = location.hash.startsWith("#/photo");
 }
 
 function fmtWhen(iso) {
@@ -82,8 +87,87 @@ function fmtDate(iso) {
   return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }
 
+function ago(iso) {
+  const days = Math.floor((Date.now() - new Date(iso)) / 86400000);
+  if (isNaN(days)) return "";
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 30) return `${days} d ago`;
+  return fmtDate(iso);
+}
+
 function photo(p, big = false) {
+  if (p.latest_photo) {
+    return `<div class="photo has-img"><img src="api/photos/${p.latest_photo.id}/thumb" alt="" loading="lazy"><span class="badge">${p.number}</span></div>`;
+  }
   return `<div class="photo${big ? " big" : ""}">${LEAF}<span class="num">${p.number}</span>${big ? '<span class="note">No photo yet</span>' : ""}</div>`;
+}
+
+// Two hidden file inputs styled as buttons: one opens the camera, one the gallery.
+function pickButtons(id) {
+  return `<label class="btn primary" for="${id}-cam">Take photo</label>
+    <input type="file" id="${id}-cam" accept="image/*" capture="environment" hidden>
+    <label class="btn" for="${id}-gal">From gallery</label>
+    <input type="file" id="${id}-gal" accept="image/*" hidden>`;
+}
+
+function onPick(id, handler) {
+  for (const suffix of ["cam", "gal"]) {
+    const input = document.getElementById(`${id}-${suffix}`);
+    input.addEventListener("change", () => { if (input.files[0]) handler(input.files[0]); input.value = ""; });
+  }
+}
+
+function gallery(p) {
+  if (!p.photos.length) {
+    return `<div class="photo big">${LEAF}<span class="num">${p.number}</span><span class="note">No photo yet</span></div>`;
+  }
+  const slides = p.photos.map((ph, i) => `<figure class="slide" data-i="${i}">
+      <img src="api/photos/${ph.id}/full" alt="Plant ${p.number}, ${esc(fmtDate(ph.taken_at))}" ${i ? 'loading="lazy"' : ""}></figure>`).join("");
+  const nav = p.photos.length > 1
+    ? `<button class="btn icon" id="gal-prev" aria-label="Newer photo">‹</button><button class="btn icon" id="gal-next" aria-label="Older photo">›</button>`
+    : "";
+  return `<div class="gallery" id="gal">${slides}</div>
+    <div class="gal-meta">
+      <span class="grow"><strong id="gal-date"></strong> <span class="muted" id="gal-count"></span></span>
+      ${nav}
+      <button class="btn small danger" id="gal-del">Delete</button>
+    </div>
+    <p class="gal-note" id="gal-note"></p>`;
+}
+
+function wireGallery(p) {
+  const gal = document.getElementById("gal");
+  if (!gal) return;
+  let index = 0;
+  const show = () => {
+    const ph = p.photos[index];
+    document.getElementById("gal-date").textContent = fmtWhen(ph.taken_at);
+    document.getElementById("gal-count").textContent = p.photos.length > 1 ? `· ${index + 1} of ${p.photos.length}${index === 0 ? " (latest)" : ""}` : "";
+    const note = document.getElementById("gal-note");
+    note.textContent = ph.note;
+    note.hidden = !ph.note;
+    const prev = document.getElementById("gal-prev"), next = document.getElementById("gal-next");
+    if (prev) prev.disabled = index === 0;
+    if (next) next.disabled = index === p.photos.length - 1;
+  };
+  const go = i => gal.scrollTo({ left: i * gal.clientWidth, behavior: "smooth" });
+  gal.addEventListener("scroll", () => {
+    const i = Math.round(gal.scrollLeft / gal.clientWidth);
+    if (i !== index && i >= 0 && i < p.photos.length) { index = i; show(); }
+  }, { passive: true });
+  document.getElementById("gal-prev")?.addEventListener("click", () => go(index - 1));
+  document.getElementById("gal-next")?.addEventListener("click", () => go(index + 1));
+  document.getElementById("gal-del").addEventListener("click", async () => {
+    const ph = p.photos[index];
+    if (!await confirmBox(`Delete the photo from ${fmtDate(ph.taken_at)}? This can't be undone.`)) return;
+    try {
+      await api(`photos/${ph.id}`, { method: "DELETE" });
+      toast("Photo deleted");
+      await viewPlant(p.number);
+    } catch (err) { toast(err.message, true); }
+  });
+  show();
 }
 
 // ---------- views ----------
@@ -105,6 +189,7 @@ async function viewHome() {
       <div class="tile-body">
         <div class="tile-name">${esc(p.name)}</div>
         <div class="tile-sub">${p.position ? esc(p.position) : esc(p.species) || "&nbsp;"}</div>
+        <span class="chip${p.latest_photo ? "" : " dim"}">${p.latest_photo ? "📷 " + esc(ago(p.latest_photo.taken_at)) : "No photo"}</span>
       </div></a>`;
   let html = `<p class="summary">${data.count} plants · next: ${esc(data.next_check.label)}, ${esc(fmtWhen(data.next_check.at))}</p>`;
   for (const a of data.areas) {
@@ -130,7 +215,8 @@ async function viewPlant(number) {
     ? `<ul class="log">${p.location_log.map(l => `<li><span class="muted">${esc(fmtDate(l.at))}</span><br>${esc(l.from_text)} → ${esc(l.to_text)}</li>`).join("")}</ul>`
     : `<p class="later">No moves recorded yet.</p>`;
   view.innerHTML = `
-    ${photo(p, true)}
+    ${gallery(p)}
+    <div class="row-actions photo-actions">${pickButtons("pp")}</div>
     <div class="plant-head">
       <h2>${esc(p.name)}</h2>
       ${p.species ? `<div class="species">${esc(p.species)}</div>` : ""}
@@ -144,9 +230,79 @@ async function viewPlant(number) {
       ${fact("Soil sensor", p.soil_sensor)}
     </dl></div>
     ${p.care_notes ? `<div class="card"><h3>Care notes</h3><p class="prose">${esc(p.care_notes)}</p></div>` : ""}
-    <div class="card"><h3>Photos, watering &amp; diagnoses</h3><p class="later">Coming in the next stages: photo history, last watered, soil readings and Claude's diagnoses.</p></div>
+    <div class="card"><h3>Watering &amp; diagnoses</h3><p class="later">Coming in the next stages: last watered, soil readings and Claude's diagnoses.</p></div>
     <div class="card"><h3>Location history</h3>${log}</div>
-    <div class="row-actions"><a class="btn primary" href="#/plant/${p.number}/edit">Edit details</a></div>`;
+    <div class="row-actions"><a class="btn" href="#/plant/${p.number}/edit">Edit details</a></div>`;
+  wireGallery(p);
+  onPick("pp", file => { pendingPhoto = { number: p.number, file }; location.hash = `#/photo/${p.number}`; });
+}
+
+async function viewPhoto(number) {
+  const ov = await api("overview");
+  let file = pendingPhoto && (number === null || pendingPhoto.number === number) ? pendingPhoto.file : null;
+  pendingPhoto = null;
+  const back = number ? `#/plant/${number}` : "#/";
+  setBar("New photo", back);
+
+  let options = number ? "" : `<option value="">— Choose a plant —</option>`;
+  for (const a of ov.areas) {
+    const inArea = a.spots.flatMap(s => s.plants);
+    if (!inArea.length) continue;
+    options += `<optgroup label="${esc(a.name)}">` + inArea.map(pl =>
+      `<option value="${pl.number}"${pl.number === number ? " selected" : ""}>${pl.number} · ${esc(pl.name)}</option>`).join("") + `</optgroup>`;
+  }
+  if (ov.unplaced.length) options += `<optgroup label="No location">` + ov.unplaced.map(pl =>
+    `<option value="${pl.number}"${pl.number === number ? " selected" : ""}>${pl.number} · ${esc(pl.name)}</option>`).join("") + `</optgroup>`;
+
+  view.innerHTML = `<form id="photo-form" autocomplete="off">
+    <div class="field"><label for="ph-plant">Plant</label><select id="ph-plant" name="plant">${options}</select></div>
+    <div id="ph-preview"></div>
+    <div class="row-actions" id="ph-pick">${pickButtons("np")}</div>
+    <div class="field"><label for="ph-note">Note <span class="hint">optional — e.g. new leaf, yellowing on the left</span></label>
+      <textarea id="ph-note" name="note" maxlength="500"></textarea></div>
+    <div class="row-actions">
+      <button class="btn primary" type="submit" id="ph-save" disabled>Save photo</button>
+      <a class="btn" href="${back}">Cancel</a>
+    </div></form>`;
+
+  const preview = document.getElementById("ph-preview");
+  const save = document.getElementById("ph-save");
+  let previewUrl = null;
+  const setFile = f => {
+    file = f;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = URL.createObjectURL(f);
+    preview.innerHTML = `<div class="preview"><img src="${previewUrl}" alt="Photo to save"></div>`;
+    save.disabled = false;
+    document.querySelector('#ph-pick label[for="np-cam"]').textContent = "Retake";
+    document.querySelector('#ph-pick label[for="np-cam"]').classList.remove("primary");
+    document.querySelector('#ph-pick label[for="np-gal"]').textContent = "Choose another";
+  };
+  onPick("np", setFile);
+  if (file) setFile(file);
+
+  document.getElementById("photo-form").addEventListener("submit", async e => {
+    e.preventDefault();
+    const target = Number(document.getElementById("ph-plant").value);
+    if (!target) { toast("Choose the plant first.", true); return; }
+    if (!file) { toast("Take or choose a photo first.", true); return; }
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("note", document.getElementById("ph-note").value);
+    fd.append("taken_hint", String(file.lastModified || Date.now()));
+    save.disabled = true;
+    save.textContent = "Saving…";
+    try {
+      await api(`plants/${target}/photos`, { method: "POST", body: fd });
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      toast("Photo saved");
+      location.hash = `#/plant/${target}`;
+    } catch (err) {
+      toast(err.message, true);
+      save.disabled = false;
+      save.textContent = "Save photo";
+    }
+  });
 }
 
 async function viewEdit(number) {
@@ -341,6 +497,7 @@ async function route() {
     if ((m = h.match(/^#\/plant\/(\d+)\/edit$/))) await viewEdit(Number(m[1]));
     else if ((m = h.match(/^#\/plant\/(\d+)$/))) await viewPlant(Number(m[1]));
     else if (h === "#/new") await viewEdit(null);
+    else if ((m = h.match(/^#\/photo(?:\/(\d+))?$/))) await viewPhoto(m[1] ? Number(m[1]) : null);
     else if (h === "#/settings") await viewSettings();
     else await viewHome();
     window.scrollTo(0, 0);
