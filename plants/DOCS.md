@@ -4,7 +4,7 @@
 
 - **Home:** tiles grouped by area, then spot. Tap a tile to open the plant.
 - **Plant page:** location, watering rule, next check, grow light, pot and care notes, plus the plant's location history. **Edit details** changes any of these; changing the spot or position is logged as a move.
-- **Photos:** on a plant page, **Take photo** opens the camera and **From gallery** picks an existing picture; add a note if you like, then **Save photo**. The camera icon at the top of the home screen does the same for any plant. Swipe the big photo to go back through older ones; **Delete** removes the one showing.
+- **Photos:** take the photo with the phone's camera app, then on the plant page tap **Add photo** and pick it; add a note if you like, then **Save photo**. (The Home Assistant phone app always opens the file picker, not the camera.) The camera icon at the top of the home screen does the same for any plant. Swipe the big photo to go back through older ones; **Delete** removes the one showing.
 - **Settings (gear icon):** add, edit or remove plants; add, rename, reorder or remove areas and spots; import or export the plant list.
 
 ## Plant numbers

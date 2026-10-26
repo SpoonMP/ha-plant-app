@@ -103,19 +103,16 @@ function photo(p, big = false) {
   return `<div class="photo${big ? " big" : ""}">${LEAF}<span class="num">${p.number}</span>${big ? '<span class="note">No photo yet</span>' : ""}</div>`;
 }
 
-// Two hidden file inputs styled as buttons: one opens the camera, one the gallery.
-function pickButtons(id) {
-  return `<label class="btn primary" for="${id}-cam">Take photo</label>
-    <input type="file" id="${id}-cam" accept="image/*" capture="environment" hidden>
-    <label class="btn" for="${id}-gal">From gallery</label>
-    <input type="file" id="${id}-gal" accept="image/*" hidden>`;
+// One hidden file input styled as a button. The Companion app always opens the
+// file picker (it ignores a camera request), so photos are taken with the camera app first.
+function pickButtons(id, label = "Add photo") {
+  return `<label class="btn primary" for="${id}-file">${label}</label>
+    <input type="file" id="${id}-file" accept="image/*" hidden>`;
 }
 
 function onPick(id, handler) {
-  for (const suffix of ["cam", "gal"]) {
-    const input = document.getElementById(`${id}-${suffix}`);
-    input.addEventListener("change", () => { if (input.files[0]) handler(input.files[0]); input.value = ""; });
-  }
+  const input = document.getElementById(`${id}-file`);
+  input.addEventListener("change", () => { if (input.files[0]) handler(input.files[0]); input.value = ""; });
 }
 
 function gallery(p) {
@@ -258,6 +255,7 @@ async function viewPhoto(number) {
     <div class="field"><label for="ph-plant">Plant</label><select id="ph-plant" name="plant">${options}</select></div>
     <div id="ph-preview"></div>
     <div class="row-actions" id="ph-pick">${pickButtons("np")}</div>
+    <p class="muted hint-line">Take the photo with the camera app first, then pick it here.</p>
     <div class="field"><label for="ph-note">Note <span class="hint">optional — e.g. new leaf, yellowing on the left</span></label>
       <textarea id="ph-note" name="note" maxlength="500"></textarea></div>
     <div class="row-actions">
@@ -274,9 +272,9 @@ async function viewPhoto(number) {
     previewUrl = URL.createObjectURL(f);
     preview.innerHTML = `<div class="preview"><img src="${previewUrl}" alt="Photo to save"></div>`;
     save.disabled = false;
-    document.querySelector('#ph-pick label[for="np-cam"]').textContent = "Retake";
-    document.querySelector('#ph-pick label[for="np-cam"]').classList.remove("primary");
-    document.querySelector('#ph-pick label[for="np-gal"]').textContent = "Choose another";
+    const pick = document.querySelector('#ph-pick label[for="np-file"]');
+    pick.textContent = "Choose another";
+    pick.classList.remove("primary");
   };
   onPick("np", setFile);
   if (file) setFile(file);

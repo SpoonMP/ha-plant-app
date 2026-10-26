@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- One **Add photo** button instead of Take photo / From gallery: the Companion app always opens the file picker, so photos are taken with the camera app first and picked here.
+
 ## 0.2.1
 
 - Fix: after an update, phones could keep using the old app script (the photo screen didn't open). Files are now re-checked on every load and the script link carries the version.
