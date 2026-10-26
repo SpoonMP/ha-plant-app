@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Fix: after an update, phones could keep using the old app script (the photo screen didn't open). Files are now re-checked on every load and the script link carries the version.
+
 ## 0.2.0
 
 - Photos: take a photo or pick one from the gallery (plant page, or the camera icon on the home screen), with an optional note.

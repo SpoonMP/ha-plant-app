@@ -39,7 +39,7 @@ from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -51,7 +51,7 @@ log = logging.getLogger("plants")
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 mqtt = Publisher(VERSION)
 
@@ -140,10 +140,19 @@ async def publish_all(image: bool = False) -> None:
 # ---------- pages ----------
 
 async def index(request: Request):
-    return FileResponse(
-        os.path.join(STATIC, "index.html"),
-        headers={"Cache-Control": "no-cache"},
-    )
+    # The version in the script/style links makes phones fetch fresh files after an update.
+    with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as f:
+        html = f.read().replace("__VERSION__", VERSION)
+    return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+
+class RevalidatingStatic(StaticFiles):
+    """Static files that the browser must re-check before reusing (cheap: 304 if unchanged)."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 # ---------- API: plants ----------
@@ -425,7 +434,7 @@ routes = [
     Route("/api/spots/{id:int}", api_spot, methods=["PUT", "DELETE"]),
     Route("/api/export", api_export),
     Route("/api/import", api_import, methods=["POST"]),
-    Mount("/static", app=StaticFiles(directory=STATIC), name="static"),
+    Mount("/static", app=RevalidatingStatic(directory=STATIC), name="static"),
 ]
 
 app = SourceGuard(Starlette(routes=routes, lifespan=lifespan))
