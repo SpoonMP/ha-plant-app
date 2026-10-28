@@ -16,7 +16,7 @@ This repository holds **code only**. The plant list, photos and history live on 
 | Stage | What | State |
 |---|---|---|
 | 1 | Skeleton: plant tiles grouped by area/spot, plant pages, settings, import/export | Done |
-| 2 | Photos + Home Assistant camera entities | Planned |
-| 3 | Watering log, water round, Home Assistant sensors | Planned |
-| 4 | Diagnosis write-back, location changes from chat | Planned |
+| 2 | Photos + Home Assistant camera entities | Done |
+| 3 | Watering log, water round, Home Assistant sensors | Done |
+| 4 | Photo sets, editable notes, diagnoses with action checklists, location changes from chat | Done |
 | 5 | Soil sensors | Planned |

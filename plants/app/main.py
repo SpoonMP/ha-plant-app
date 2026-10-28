@@ -51,7 +51,7 @@ log = logging.getLogger("plants")
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 mqtt = Publisher(VERSION, lambda: next_check()["at"])
 
@@ -264,6 +264,9 @@ async def api_round(request):
 
 @handle
 async def api_photo_upload(request):
+    """One photo per request. The first photo of an upload creates the set (with the set
+    note); the phone sends the others with that set_id, so each one shows progress and
+    a failure doesn't lose the ones already saved."""
     number = int(request.path_params["number"])
     with db.session() as con:
         db.get_plant(con, number)  # 404 if the plant doesn't exist
@@ -273,11 +276,18 @@ async def api_photo_upload(request):
         raise db.UserError("No photo was sent.")
     raw = await upload.read()
     note = str(form.get("note") or "")[:500]
+    set_id = form.get("set_id")
     hint = form.get("taken_hint")
     # Decoding and resizing takes a second or two on the Pi: keep it off the event loop.
     processed = await run_in_threadpool(photos.process_upload, raw, hint)
     with db.session() as con:
-        photo_id = db.add_photo(con, number, processed["taken_at"], note, 0, 0, 0)
+        if set_id not in (None, ""):
+            set_id = int(set_id)
+            new_set = False
+        else:
+            set_id = db.create_set(con, number, str(form.get("set_note") or ""))
+            new_set = True
+        photo_id = db.add_photo(con, number, set_id, processed["taken_at"], note, 0, 0, 0)
         try:
             w, h, size = await run_in_threadpool(photos.store, number, photo_id, processed["image"])
         except Exception:
@@ -285,7 +295,8 @@ async def api_photo_upload(request):
             raise
         con.execute("UPDATE photos SET width=?, height=?, bytes=? WHERE id=?", (w, h, size, photo_id))
         photo = db.get_photo(con, photo_id)
-    await publish(number)
+    # The camera entity shows the newest set's first photo: only re-send it for a new set.
+    await publish(number, image=new_set)
     return ok(photo, 201)
 
 
@@ -301,12 +312,112 @@ async def api_photo(request):
     if request.method == "PUT":
         data = await body(request)
         with db.session() as con:
-            p = db.get_photo(con, photo_id)
-            con.execute("UPDATE photos SET note=? WHERE id=?", (str(data.get("note") or "").strip()[:500], photo_id))
+            p = db.update_photo_note(con, photo_id, str(data.get("note") or ""))
         await publish(p["plant_number"], image=False)
         return ok()
     with db.session() as con:
         return ok(db.get_photo(con, photo_id))
+
+
+@handle
+async def api_set(request):
+    set_id = int(request.path_params["id"])
+    if request.method == "PUT":
+        data = await body(request)
+        with db.session() as con:
+            s = db.update_set_note(con, set_id, str(data.get("note") or ""))
+        await publish(s["plant_number"], image=False)
+        return ok()
+    with db.session() as con:
+        return ok(db.get_set(con, set_id))
+
+
+# ---------- API: diagnoses ----------
+
+@handle
+async def api_diagnosis_add(request):
+    """Written by Claude after a plant check (through ha-mcp's app proxy).
+    Body: {finding, actions: [text | {text, done}], photo_ids: [...], at?, source?}"""
+    number = int(request.path_params["number"])
+    data = await body(request)
+    with db.session() as con:
+        did = db.add_diagnosis(
+            con, number, data.get("finding"), data.get("actions"), data.get("photo_ids"),
+            data.get("at"), data.get("source") or "claude", bool(data.get("seen")),
+        )
+        d = db.get_diagnosis(con, did)
+    await publish(number, image=False)
+    return ok(d, 201)
+
+
+@handle
+async def api_diagnosis(request):
+    did = int(request.path_params["id"])
+    if request.method == "PUT":
+        data = await body(request)
+        with db.session() as con:
+            number = db.update_diagnosis(con, did, data)
+            d = db.get_diagnosis(con, did)
+        await publish(number, image=False)
+        return ok(d)
+    if request.method == "DELETE":
+        with db.session() as con:
+            number = db.delete_diagnosis(con, did)
+        await publish(number, image=False)
+        return ok()
+    with db.session() as con:
+        return ok(db.get_diagnosis(con, did))
+
+
+@handle
+async def api_action(request):
+    action_id = int(request.path_params["id"])
+    if request.method == "DELETE":
+        with db.session() as con:
+            number = db.delete_action(con, action_id)
+    else:
+        data = await body(request)
+        with db.session() as con:
+            number = db.update_action(con, action_id, data)
+    await publish(number, image=False)
+    return ok()
+
+
+@handle
+async def api_seen(request):
+    number = int(request.path_params["number"])
+    with db.session() as con:
+        changed = db.mark_seen(con, number)
+    if changed:
+        await publish(number, image=False)
+    return ok()
+
+
+@handle
+async def api_check(request):
+    """Plant check bundle: ?numbers=7,20 for those plants, otherwise every plant waiting
+    (photos added since its last diagnosis)."""
+    raw = request.query_params.get("numbers", "").strip()
+    with db.session() as con:
+        if raw:
+            numbers = [int(x) for x in raw.replace(" ", "").split(",") if x]
+        else:
+            numbers = db.overview(con)["waiting"]
+        plants = [db.check_bundle(con, n) for n in numbers]
+    return ok({"waiting": numbers if not raw else None, "plants": plants, "now": db.now_iso()})
+
+
+@handle
+async def api_review(request):
+    """Show one stored photo (1600 px) in HA's review camera, so Claude can look at it."""
+    data = await body(request)
+    with db.session() as con:
+        ph = db.get_photo(con, int(data.get("photo_id")))
+        name = db.get_plant(con, ph["plant_number"])["name"]
+    if not mqtt.connected:
+        raise db.UserError("MQTT isn't connected, so the review camera can't be updated.")
+    await run_in_threadpool(mqtt.publish_review, ph, name)
+    return ok({"photo_id": ph["id"], "plant_number": ph["plant_number"], "camera": "camera.plants_review"})
 
 
 @handle
@@ -499,6 +610,13 @@ routes = [
     Route("/api/round", api_round, methods=["POST"]),
     Route("/api/photos/{id:int}", api_photo, methods=["GET", "PUT", "DELETE"]),
     Route("/api/photos/{id:int}/{size:str}", api_photo_file),
+    Route("/api/sets/{id:int}", api_set, methods=["GET", "PUT"]),
+    Route("/api/plants/{number:int}/diagnoses", api_diagnosis_add, methods=["POST"]),
+    Route("/api/plants/{number:int}/seen", api_seen, methods=["POST"]),
+    Route("/api/diagnoses/{id:int}", api_diagnosis, methods=["GET", "PUT", "DELETE"]),
+    Route("/api/actions/{id:int}", api_action, methods=["PUT", "DELETE"]),
+    Route("/api/check", api_check),
+    Route("/api/review", api_review, methods=["POST"]),
     Route("/api/locations", api_locations),
     Route("/api/areas", api_areas_create, methods=["POST"]),
     Route("/api/areas/{id:int}", api_area, methods=["PUT", "DELETE"]),

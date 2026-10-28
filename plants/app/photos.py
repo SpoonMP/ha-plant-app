@@ -115,6 +115,12 @@ def camera_jpeg(number: int, photo_id: int) -> bytes:
     return out.getvalue()
 
 
+def full_jpeg(number: int, photo_id: int) -> bytes:
+    """The stored 1600 px file as-is (for the review camera)."""
+    with open(full_path(number, photo_id), "rb") as f:
+        return f.read()
+
+
 def remove_files(number: int, photo_id: int) -> None:
     for path in (full_path(number, photo_id), thumb_path(number, photo_id)):
         try:

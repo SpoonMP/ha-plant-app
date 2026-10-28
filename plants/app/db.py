@@ -12,7 +12,7 @@ from datetime import datetime
 DATA_DIR = os.environ.get("PLANTS_DATA_DIR", "/data").strip()
 DB_PATH = os.path.join(DATA_DIR, "plants.db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -73,6 +73,34 @@ CREATE TABLE IF NOT EXISTS care_log (
     source       TEXT NOT NULL DEFAULT 'app'
 );
 CREATE INDEX IF NOT EXISTS care_by_plant ON care_log (plant_number, at);
+CREATE TABLE IF NOT EXISTS photo_sets (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_number INTEGER NOT NULL REFERENCES plants(number) ON DELETE CASCADE,
+    created_at   TEXT NOT NULL,
+    note         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS sets_by_plant ON photo_sets (plant_number, created_at);
+CREATE TABLE IF NOT EXISTS diagnoses (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_number INTEGER NOT NULL REFERENCES plants(number) ON DELETE CASCADE,
+    at           TEXT NOT NULL,
+    finding      TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'claude',
+    seen         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS diagnoses_by_plant ON diagnoses (plant_number, at);
+CREATE TABLE IF NOT EXISTS diagnosis_actions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    diagnosis_id INTEGER NOT NULL REFERENCES diagnoses(id) ON DELETE CASCADE,
+    sort         INTEGER NOT NULL DEFAULT 0,
+    text         TEXT NOT NULL,
+    done_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS diagnosis_photos (
+    diagnosis_id INTEGER NOT NULL REFERENCES diagnoses(id) ON DELETE CASCADE,
+    photo_id     INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    PRIMARY KEY (diagnosis_id, photo_id)
+);
 """
 
 PLANT_TEXT_FIELDS = (
@@ -119,6 +147,30 @@ def init_db() -> None:
         )
         # Highest plant number ever used, so numbers of removed plants are never reused.
         con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('max_number', '0')")
+        _migrate_photo_sets(con)
+
+
+def _migrate_photo_sets(con) -> None:
+    """0.4.0: photos belong to a set (one upload). Older photos each become a set of one."""
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(photos)")}
+    if "set_id" not in cols:
+        con.execute("ALTER TABLE photos ADD COLUMN set_id INTEGER REFERENCES photo_sets(id)")
+    for r in con.execute("SELECT id, plant_number, uploaded_at FROM photos WHERE set_id IS NULL").fetchall():
+        set_id = con.execute(
+            "INSERT INTO photo_sets (plant_number, created_at, note) VALUES (?,?,'')",
+            (r["plant_number"], r["uploaded_at"]),
+        ).lastrowid
+        con.execute("UPDATE photos SET set_id=? WHERE id=?", (set_id, r["id"]))
+    con.execute("CREATE INDEX IF NOT EXISTS photos_by_set ON photos (set_id)")
+
+
+def norm_time(value) -> str:
+    """Any ISO date/time from a caller → the app's own format (local time, seconds)."""
+    try:
+        when = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise UserError(f"'{value}' isn't a date and time (use ISO, e.g. 2026-10-25T21:00).")
+    return when.astimezone().isoformat(timespec="seconds")
 
 
 # ---------- helpers ----------
@@ -172,6 +224,7 @@ def plant_dict(con, row) -> dict:
         "SELECT COUNT(*) FROM photos WHERE plant_number=?", (d["number"],)
     ).fetchone()[0]
     d.update(care_summary(con, d["number"]))
+    d.update(diagnosis_summary(con, d["number"]))
     return d
 
 
@@ -193,7 +246,10 @@ def overview(con) -> dict:
             {**s, "plants": by_spot.get(s["id"], [])}
             for s in spots if s["area_id"] == a["id"]
         ]
-    return {"areas": areas, "unplaced": unplaced, "count": len(plants), "next_number": next_number(con)}
+    return {
+        "areas": areas, "unplaced": unplaced, "count": len(plants), "next_number": next_number(con),
+        "waiting": [p["number"] for p in plants if p["waiting"]],
+    }
 
 
 def get_plant(con, number: int) -> dict:
@@ -208,7 +264,9 @@ def get_plant(con, number: int) -> dict:
         )
     ]
     d["photos"] = list_photos(con, number)
+    d["sets"] = list_sets(con, number, d["photos"])
     d["care_log"] = list_care(con, number)
+    d["diagnoses"] = list_diagnoses(con, number)
     return d
 
 
@@ -266,6 +324,8 @@ def update_plant(con, number: int, data: dict, log_move: bool = True) -> None:
     row = con.execute("SELECT * FROM plants WHERE number=?", (number,)).fetchone()
     if not row:
         raise KeyError(number)
+    if "spot_id" not in data and data.get("area") and data.get("spot"):
+        data = {**data, "spot_id": spot_id_by_name(con, data["area"], data["spot"])}
     fields = _clean_plant_fields(data)
     if not fields:
         return
@@ -284,6 +344,20 @@ def update_plant(con, number: int, data: dict, log_move: bool = True) -> None:
         )
 
 
+def spot_id_by_name(con, area: str, spot: str) -> int:
+    """An existing spot, by area and spot name (e.g. for a move written from chat)."""
+    area, spot = str(area).strip(), str(spot).strip()
+    row = con.execute(
+        "SELECT s.id FROM spots s JOIN areas a ON a.id=s.area_id WHERE a.name=? AND s.name=?",
+        (area, spot),
+    ).fetchone()
+    if not row:
+        known = [f"{r['a']} › {r['s']}" for r in con.execute(
+            "SELECT a.name AS a, s.name AS s FROM spots s JOIN areas a ON a.id=s.area_id ORDER BY a.sort, s.sort")]
+        raise UserError(f"No spot '{spot}' in area '{area}'. Spots: {', '.join(known)}")
+    return row[0]
+
+
 def delete_plant(con, number: int) -> None:
     cur = con.execute("DELETE FROM plants WHERE number=?", (number,))
     if cur.rowcount == 0:
@@ -292,46 +366,104 @@ def delete_plant(con, number: int) -> None:
 
 # ---------- photos ----------
 
-PHOTO_FIELDS = "id, plant_number, taken_at, uploaded_at, note, width, height, bytes"
+PHOTO_FIELDS = ("p.id, p.plant_number, p.set_id, p.taken_at, p.uploaded_at, p.note, "
+                "p.width, p.height, p.bytes, s.note AS set_note, s.created_at AS set_created_at")
+PHOTO_FROM = "photos p LEFT JOIN photo_sets s ON s.id = p.set_id"
+# Newest set first; inside a set, in the order the photos were taken.
+PHOTO_ORDER = "s.created_at DESC, p.set_id DESC, p.taken_at, p.id"
 
 
 def list_photos(con, number: int) -> list:
-    """All photos of a plant, newest first."""
+    """All photos of a plant: newest set first, each set's photos in the order taken."""
     return [dict(r) for r in con.execute(
-        f"SELECT {PHOTO_FIELDS} FROM photos WHERE plant_number=? ORDER BY taken_at DESC, id DESC",
+        f"SELECT {PHOTO_FIELDS} FROM {PHOTO_FROM} WHERE p.plant_number=? ORDER BY {PHOTO_ORDER}",
         (number,),
     )]
 
 
+def list_sets(con, number: int, photos: list | None = None) -> list:
+    """A plant's photo sets, newest first, each with its photos."""
+    photos = photos if photos is not None else list_photos(con, number)
+    out, by_id = [], {}
+    for ph in photos:
+        s = by_id.get(ph["set_id"])
+        if s is None:
+            s = {"id": ph["set_id"], "created_at": ph["set_created_at"], "note": ph["set_note"] or "", "photos": []}
+            by_id[ph["set_id"]] = s
+            out.append(s)
+        s["photos"].append(ph)
+    return out
+
+
 def latest_photo(con, number: int):
+    """The first photo of the newest set: shown on the tile and in HA's camera entity."""
     row = con.execute(
-        f"SELECT {PHOTO_FIELDS} FROM photos WHERE plant_number=? ORDER BY taken_at DESC, id DESC LIMIT 1",
+        f"SELECT {PHOTO_FIELDS} FROM {PHOTO_FROM} WHERE p.plant_number=? ORDER BY {PHOTO_ORDER} LIMIT 1",
         (number,),
     ).fetchone()
     return dict(row) if row else None
 
 
 def get_photo(con, photo_id: int) -> dict:
-    row = con.execute(f"SELECT {PHOTO_FIELDS} FROM photos WHERE id=?", (photo_id,)).fetchone()
+    row = con.execute(f"SELECT {PHOTO_FIELDS} FROM {PHOTO_FROM} WHERE p.id=?", (photo_id,)).fetchone()
     if not row:
         raise KeyError(photo_id)
     return dict(row)
 
 
-def add_photo(con, number: int, taken_at: str, note: str, width: int, height: int, size: int) -> int:
+def create_set(con, number: int, note: str = "") -> int:
     if not con.execute("SELECT 1 FROM plants WHERE number=?", (number,)).fetchone():
         raise KeyError(number)
     return con.execute(
-        "INSERT INTO photos (plant_number, taken_at, uploaded_at, note, width, height, bytes) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (number, taken_at, now_iso(), (note or "").strip(), width, height, size),
+        "INSERT INTO photo_sets (plant_number, created_at, note) VALUES (?,?,?)",
+        (number, now_iso(), (note or "").strip()[:1000]),
+    ).lastrowid
+
+
+def get_set(con, set_id: int) -> dict:
+    row = con.execute("SELECT * FROM photo_sets WHERE id=?", (set_id,)).fetchone()
+    if not row:
+        raise KeyError(set_id)
+    return dict(row)
+
+
+def update_set_note(con, set_id: int, note: str) -> dict:
+    s = get_set(con, set_id)
+    con.execute("UPDATE photo_sets SET note=? WHERE id=?", ((note or "").strip()[:1000], set_id))
+    return s
+
+
+def update_photo_note(con, photo_id: int, note: str) -> dict:
+    p = get_photo(con, photo_id)
+    con.execute("UPDATE photos SET note=? WHERE id=?", ((note or "").strip()[:500], photo_id))
+    return p
+
+
+def add_photo(con, number: int, set_id: int, taken_at: str, note: str,
+              width: int, height: int, size: int) -> int:
+    s = get_set(con, set_id)
+    if s["plant_number"] != number:
+        raise UserError("That photo set belongs to another plant.")
+    return con.execute(
+        "INSERT INTO photos (plant_number, set_id, taken_at, uploaded_at, note, width, height, bytes) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (number, set_id, taken_at, now_iso(), (note or "").strip()[:500], width, height, size),
     ).lastrowid
 
 
 def delete_photo(con, photo_id: int) -> dict:
+    """Delete a photo; a set left empty goes too."""
     p = get_photo(con, photo_id)
     con.execute("DELETE FROM photos WHERE id=?", (photo_id,))
+    if p["set_id"] is not None and not con.execute(
+            "SELECT 1 FROM photos WHERE set_id=?", (p["set_id"],)).fetchone():
+        con.execute("DELETE FROM photo_sets WHERE id=?", (p["set_id"],))
     return p
+
+
+def delete_empty_set(con, set_id: int) -> None:
+    if not con.execute("SELECT 1 FROM photos WHERE set_id=?", (set_id,)).fetchone():
+        con.execute("DELETE FROM photo_sets WHERE id=?", (set_id,))
 
 
 def photos_to_thin(con, cutoff_iso: str) -> list:
@@ -408,6 +540,184 @@ def delete_care(con, care_id: int) -> int:
         raise KeyError(care_id)
     con.execute("DELETE FROM care_log WHERE id=?", (care_id,))
     return row[0]
+
+
+# ---------- diagnoses ----------
+
+def _last_diagnosis_at(con, number: int):
+    return con.execute("SELECT MAX(at) FROM diagnoses WHERE plant_number=?", (number,)).fetchone()[0]
+
+
+def waiting_photos(con, number: int) -> list:
+    """Photos added since the plant's last diagnosis (all photos if it has none)."""
+    last = _last_diagnosis_at(con, number)
+    return [dict(r) for r in con.execute(
+        f"SELECT {PHOTO_FIELDS} FROM {PHOTO_FROM} WHERE p.plant_number=? AND (? IS NULL OR p.uploaded_at > ?) "
+        f"ORDER BY {PHOTO_ORDER}",
+        (number, last, last),
+    )]
+
+
+def diagnosis_summary(con, number: int) -> dict:
+    last = _last_diagnosis_at(con, number)
+    waiting = con.execute(
+        "SELECT COUNT(*) FROM photos WHERE plant_number=? AND (? IS NULL OR uploaded_at > ?)",
+        (number, last, last),
+    ).fetchone()[0]
+    unseen = con.execute(
+        "SELECT COUNT(*) FROM diagnoses WHERE plant_number=? AND seen=0", (number,)
+    ).fetchone()[0]
+    open_actions = con.execute(
+        "SELECT COUNT(*) FROM diagnosis_actions a JOIN diagnoses d ON d.id=a.diagnosis_id "
+        "WHERE d.plant_number=? AND a.done_at IS NULL", (number,)
+    ).fetchone()[0]
+    return {
+        "last_diagnosis": last,
+        "waiting": waiting > 0,
+        "waiting_photos": waiting,
+        "new_diagnosis": unseen > 0,
+        "open_actions": open_actions,
+    }
+
+
+def _diagnosis_dict(con, row) -> dict:
+    d = dict(row)
+    d["seen"] = bool(d["seen"])
+    d["actions"] = [dict(a) for a in con.execute(
+        "SELECT id, text, done_at FROM diagnosis_actions WHERE diagnosis_id=? ORDER BY sort, id", (d["id"],))]
+    d["photo_ids"] = [r[0] for r in con.execute(
+        "SELECT dp.photo_id FROM diagnosis_photos dp JOIN photos p ON p.id=dp.photo_id "
+        "WHERE dp.diagnosis_id=? ORDER BY p.taken_at, p.id", (d["id"],))]
+    return d
+
+
+def list_diagnoses(con, number: int) -> list:
+    """A plant's diagnoses, newest first, each with its actions and the photos it used."""
+    return [_diagnosis_dict(con, r) for r in con.execute(
+        "SELECT * FROM diagnoses WHERE plant_number=? ORDER BY at DESC, id DESC", (number,))]
+
+
+def get_diagnosis(con, diagnosis_id: int) -> dict:
+    row = con.execute("SELECT * FROM diagnoses WHERE id=?", (diagnosis_id,)).fetchone()
+    if not row:
+        raise KeyError(diagnosis_id)
+    return _diagnosis_dict(con, row)
+
+
+def _clean_actions(actions) -> list:
+    if actions is None:
+        return []
+    if not isinstance(actions, list):
+        raise UserError("Actions must be a list.")
+    out = []
+    for a in actions:
+        text, done = (a.get("text"), a.get("done")) if isinstance(a, dict) else (a, False)
+        text = str(text or "").strip()[:500]
+        if text:
+            out.append((text, bool(done)))
+    return out
+
+
+def add_diagnosis(con, number: int, finding: str, actions=None, photo_ids=None,
+                  at=None, source: str = "claude", seen: bool = False) -> int:
+    if not con.execute("SELECT 1 FROM plants WHERE number=?", (number,)).fetchone():
+        raise KeyError(number)
+    finding = str(finding or "").strip()[:5000]
+    if not finding:
+        raise UserError("A diagnosis needs a finding.")
+    when = norm_time(at) if at else now_iso()
+    did = con.execute(
+        "INSERT INTO diagnoses (plant_number, at, finding, source, seen) VALUES (?,?,?,?,?)",
+        (number, when, finding, str(source or "claude")[:20], 1 if seen else 0),
+    ).lastrowid
+    for i, (text, done) in enumerate(_clean_actions(actions)):
+        con.execute(
+            "INSERT INTO diagnosis_actions (diagnosis_id, sort, text, done_at) VALUES (?,?,?,?)",
+            (did, i, text, when if done else None),
+        )
+    for pid in photo_ids or []:
+        row = con.execute("SELECT plant_number FROM photos WHERE id=?", (int(pid),)).fetchone()
+        if not row:
+            raise UserError(f"Photo {pid} doesn't exist.")
+        if row[0] != number:
+            raise UserError(f"Photo {pid} belongs to plant {row[0]}, not {number}.")
+        con.execute("INSERT OR IGNORE INTO diagnosis_photos (diagnosis_id, photo_id) VALUES (?,?)", (did, int(pid)))
+    return did
+
+
+def update_diagnosis(con, diagnosis_id: int, data: dict) -> int:
+    d = get_diagnosis(con, diagnosis_id)
+    if "finding" in data:
+        finding = str(data["finding"] or "").strip()[:5000]
+        if not finding:
+            raise UserError("A diagnosis needs a finding.")
+        con.execute("UPDATE diagnoses SET finding=?, seen=0 WHERE id=?", (finding, diagnosis_id))
+    for text, done in _clean_actions(data.get("add_actions")):
+        sort = con.execute("SELECT COALESCE(MAX(sort), -1) + 1 FROM diagnosis_actions WHERE diagnosis_id=?",
+                           (diagnosis_id,)).fetchone()[0]
+        con.execute("INSERT INTO diagnosis_actions (diagnosis_id, sort, text, done_at) VALUES (?,?,?,?)",
+                    (diagnosis_id, sort, text, now_iso() if done else None))
+    return d["plant_number"]
+
+
+def delete_diagnosis(con, diagnosis_id: int) -> int:
+    d = get_diagnosis(con, diagnosis_id)
+    con.execute("DELETE FROM diagnoses WHERE id=?", (diagnosis_id,))
+    return d["plant_number"]
+
+
+def _action_plant(con, action_id: int) -> int:
+    row = con.execute(
+        "SELECT d.plant_number FROM diagnosis_actions a JOIN diagnoses d ON d.id=a.diagnosis_id WHERE a.id=?",
+        (action_id,),
+    ).fetchone()
+    if not row:
+        raise KeyError(action_id)
+    return row[0]
+
+
+def update_action(con, action_id: int, data: dict) -> int:
+    number = _action_plant(con, action_id)
+    if "done" in data:
+        con.execute("UPDATE diagnosis_actions SET done_at=? WHERE id=?",
+                    (now_iso() if data["done"] else None, action_id))
+    if "text" in data:
+        text = str(data["text"] or "").strip()[:500]
+        if not text:
+            raise UserError("An action can't be empty.")
+        con.execute("UPDATE diagnosis_actions SET text=? WHERE id=?", (text, action_id))
+    return number
+
+
+def delete_action(con, action_id: int) -> int:
+    number = _action_plant(con, action_id)
+    con.execute("DELETE FROM diagnosis_actions WHERE id=?", (action_id,))
+    return number
+
+
+def mark_seen(con, number: int) -> bool:
+    """Mark a plant's diagnoses as read. Returns True if anything changed."""
+    return con.execute("UPDATE diagnoses SET seen=1 WHERE plant_number=? AND seen=0", (number,)).rowcount > 0
+
+
+def check_bundle(con, number: int) -> dict:
+    """Everything a plant check needs for one plant, in one read."""
+    p = get_plant(con, number)
+    waiting = waiting_photos(con, number)
+    return {
+        "number": p["number"], "name": p["name"], "species": p["species"],
+        "location": p["location"], "position": p["position"], "pot": p["pot"],
+        "grow_light": p["grow_light"], "watering_rule": p["watering_rule"],
+        "care_notes": p["care_notes"], "soil_sensor": p["soil_sensor"],
+        "last_watered": p["last_watered"], "last_checked": p["last_checked"], "last_fed": p["last_fed"],
+        "care_log": p["care_log"][:15],
+        "location_log": p["location_log"][:5],
+        "waiting_photos": [
+            {k: ph[k] for k in ("id", "set_id", "taken_at", "uploaded_at", "note", "set_note")}
+            for ph in waiting
+        ],
+        "diagnoses": p["diagnoses"][:5],
+    }
 
 
 # ---------- area / spot writes ----------
@@ -519,6 +829,11 @@ def export_all(con) -> dict:
                 (r["number"],),
             )
         ]
+        p["diagnoses"] = [
+            {"at": d["at"], "finding": d["finding"], "source": d["source"],
+             "actions": [{"text": a["text"], "done": a["done_at"] is not None} for a in d["actions"]]}
+            for d in reversed(list_diagnoses(con, r["number"]))
+        ]
         plants.append(p)
     return {
         "format": "ha-plant-app",
@@ -577,5 +892,8 @@ def import_all(con, data: dict) -> dict:
             for entry in p.get("care_log", []) or []:
                 add_care(con, number, entry["kind"], bool(entry.get("fed")), entry.get("note", ""),
                          entry.get("source", "import"), entry["at"])
+            for entry in p.get("diagnoses", []) or []:
+                add_diagnosis(con, number, entry.get("finding"), entry.get("actions"), None,
+                              entry.get("at"), entry.get("source", "import"), seen=True)
             added += 1
     return {"added": added, "updated": updated}

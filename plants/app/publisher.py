@@ -6,6 +6,9 @@ One HA device per plant ("Plant 7 – Parlour palm") with:
   sensor.plant_7_location      area › spot · position
   sensor.plant_7_last_watered / _last_fed / _next_check
   button.plant_7_watered       logs a watering from HA
+  sensor.plant_7_last_diagnosis  date of Claude's latest diagnosis (finding + actions as attributes)
+Plus one "Plants app" device with camera.plants_review: whichever stored photo
+Claude asked to look at (full 1600 px), for plant checks.
 Everything is published retained, so HA gets it back after a restart.
 """
 
@@ -34,6 +37,11 @@ def _topic(number: int, kind: str) -> str:
 
 def _config_topic(number: int) -> str:
     return f"homeassistant/device/{BASE}_plant_{number}/config"
+
+
+REVIEW_CONFIG = f"homeassistant/device/{BASE}_review/config"
+REVIEW_PHOTO = f"{BASE}/review/photo"
+REVIEW_ATTRS = f"{BASE}/review/attributes"
 
 
 def _broker_settings() -> dict | None:
@@ -115,6 +123,7 @@ class Publisher:
         log.info("MQTT connected")
         client.publish(STATUS_TOPIC, "online", qos=1, retain=True)
         client.subscribe(f"{BASE}/plant/+/watered/set", qos=1)
+        client.publish(REVIEW_CONFIG, json.dumps(self._review_discovery()), qos=1, retain=True)
         # Publishing all plants renders 20+ images, so keep it off the network thread.
         threading.Thread(target=self.publish_all, daemon=True).start()
 
@@ -177,6 +186,16 @@ class Publisher:
                 "last_checked": p["last_checked"],
                 "last_fed": p["last_fed"],
                 "next_check": self._next_check(),
+                "last_diagnosis": p["last_diagnosis"],
+            }, ensure_ascii=False))
+            last = p["diagnoses"][0] if p["diagnoses"] else None
+            self._pub(_topic(number, "diagnosis"), json.dumps({
+                "finding": last["finding"] if last else None,
+                "actions": [a["text"] for a in last["actions"]] if last else [],
+                "open_actions": [a["text"] for d in p["diagnoses"] for a in d["actions"] if not a["done_at"]],
+                "waiting_for_check": p["waiting"],
+                "new_photos": p["waiting_photos"],
+                "unread": p["new_diagnosis"],
             }, ensure_ascii=False))
             self._pub(_topic(number, "attributes"), json.dumps({
                 "plant_number": p["number"],
@@ -202,8 +221,52 @@ class Publisher:
             return
         with self._lock:
             for topic in (_config_topic(number), _topic(number, "state"),
-                          _topic(number, "attributes"), _topic(number, "photo")):
+                          _topic(number, "attributes"), _topic(number, "photo"),
+                          _topic(number, "diagnosis")):
                 self._pub(topic, b"")
+
+    def publish_review(self, ph: dict, plant_name: str) -> None:
+        """Put one stored photo (full size) into the review camera."""
+        if not self.connected:
+            return
+        data = photos.full_jpeg(ph["plant_number"], ph["id"])
+        with self._lock:
+            self._pub(REVIEW_ATTRS, json.dumps({
+                "photo_id": ph["id"],
+                "plant_number": ph["plant_number"],
+                "plant_name": plant_name,
+                "set_id": ph["set_id"],
+                "taken_at": ph["taken_at"],
+                "note": ph["note"],
+                "set_note": ph["set_note"],
+            }, ensure_ascii=False))
+            # QoS 1 and wait, so the image is in HA before the caller fetches it.
+            self.client.publish(REVIEW_PHOTO, data, qos=1, retain=True).wait_for_publish(10)
+
+    def _review_discovery(self) -> dict:
+        uid = f"{BASE}_review"
+        return {
+            "device": {
+                "identifiers": [uid],
+                "name": "Plants app",
+                "manufacturer": "Plants app",
+                "model": "Plant check",
+                "sw_version": self.version,
+            },
+            "origin": {"name": "Plants app", "sw_version": self.version, "support_url": REPO_URL},
+            "components": {
+                "review": {
+                    "platform": "camera",
+                    "name": "Review photo",
+                    "unique_id": f"{uid}_photo",
+                    "default_entity_id": "camera.plants_review",
+                    "topic": REVIEW_PHOTO,
+                    "json_attributes_topic": REVIEW_ATTRS,
+                    "availability_topic": STATUS_TOPIC,
+                },
+            },
+            "qos": 1,
+        }
 
     def _discovery(self, p: dict) -> dict:
         n = p["number"]
@@ -283,6 +346,18 @@ class Publisher:
                     "icon": "mdi:watering-can",
                     "command_topic": f"{BASE}/plant/{n}/watered/set",
                     "payload_press": "PRESS",
+                    **avail,
+                },
+                "last_diagnosis": {
+                    "platform": "sensor",
+                    "name": "Last diagnosis",
+                    "unique_id": f"{uid}_last_diagnosis",
+                    "default_entity_id": f"sensor.plant_{n}_last_diagnosis",
+                    "device_class": "timestamp",
+                    "icon": "mdi:stethoscope",
+                    "state_topic": _topic(n, "state"),
+                    "value_template": "{{ value_json.last_diagnosis }}",
+                    "json_attributes_topic": _topic(n, "diagnosis"),
                     **avail,
                 },
                 "location": {

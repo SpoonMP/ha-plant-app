@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- **Photo sets:** pick several photos at once (top, underside, close-up…). They're saved together as one set with a shared **set note**, and each photo can have its own note. Photos upload one by one with progress; if one fails, the others are kept and **Save** retries the rest.
+- **Edit notes after saving:** ✏️ next to the set note and the photo note under the big photo.
+- **Diagnoses:** Claude writes each plant check's finding and actions to the plant (through the app's API). The plant page shows a **To do** list of open actions (tick them off) and the diagnosis history with the photos each one used.
+- **Waiting for check:** tiles show 🔍 when photos were added since the plant's last diagnosis, and the home screen shows how many plants are waiting. 🩺 **New diagnosis** shows until you open the plant; ☐ shows open actions.
+- Home Assistant: **Last diagnosis** sensor per plant (`sensor.plant_7_last_diagnosis`; finding and open actions as attributes), and a **Plants app** device with `camera.plants_review`, which shows whichever photo Claude is looking at in full size.
+- Moves can be written by area and spot name (for changes from chat).
+- Existing photos become a set of one each; their notes are kept.
+
 ## 0.3.0
 
 - Watering log: **Watered** (optionally **with feed**) and **Checked, still moist** on each plant page, with a history you can delete entries from.

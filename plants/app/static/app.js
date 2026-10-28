@@ -44,27 +44,35 @@ function toast(msg, isError = false) {
 }
 
 // In-page dialog (native confirm/prompt pop-ups may not show inside the phone app).
-function dialog(text, { yesLabel = "Remove", danger = true, input = null } = {}) {
+// multiline: a text box for notes (Enter makes a new line; Save button saves).
+function dialog(text, { yesLabel = "Remove", danger = true, input = null, multiline = false } = {}) {
   return new Promise(resolve => {
     const m = document.getElementById("modal");
-    const inp = document.getElementById("modal-input");
+    const line = document.getElementById("modal-input");
+    const area = document.getElementById("modal-area");
+    const inp = multiline ? area : line;
     const yes = document.getElementById("modal-yes");
     const no = document.getElementById("modal-no");
     document.getElementById("modal-text").textContent = text;
     yes.textContent = yesLabel;
     yes.className = danger ? "btn danger" : "btn primary";
+    line.hidden = area.hidden = true;
     inp.hidden = input === null;
     inp.value = input ?? "";
     m.hidden = false;
-    if (input !== null) { inp.focus(); inp.select(); }
+    if (input !== null) { inp.focus(); if (!multiline) inp.select(); }
     const done = v => { m.hidden = true; yes.onclick = no.onclick = inp.onkeydown = null; resolve(v); };
     yes.onclick = () => done(input === null ? true : inp.value.trim());
     no.onclick = () => done(input === null ? false : null);
-    inp.onkeydown = e => { if (e.key === "Enter") yes.onclick(); if (e.key === "Escape") no.onclick(); };
+    inp.onkeydown = e => {
+      if (e.key === "Enter" && !multiline) yes.onclick();
+      if (e.key === "Escape") no.onclick();
+    };
   });
 }
 const confirmBox = text => dialog(text);
 const promptBox = (text, value) => dialog(text, { yesLabel: "Save", danger: false, input: value });
+const noteBox = (text, value) => dialog(text, { yesLabel: "Save", danger: false, input: value ?? "", multiline: true });
 
 function setBar(title, backHref) {
   titleEl.textContent = title;
@@ -105,16 +113,19 @@ function photo(p, big = false) {
 
 // One hidden file input styled as a button. The Companion app always opens the
 // file picker (it ignores a camera request), so photos are taken with the camera app first.
-function pickButtons(id, label = "Add photo") {
+function pickButtons(id, label = "Add photos") {
   return `<label class="btn primary" for="${id}-file">${label}</label>
-    <input type="file" id="${id}-file" accept="image/*" hidden>`;
+    <input type="file" id="${id}-file" accept="image/*" multiple hidden>`;
 }
 
+// Hands the picked photos (one or several) to the handler as an array.
 function onPick(id, handler) {
   const input = document.getElementById(`${id}-file`);
-  input.addEventListener("change", () => { if (input.files[0]) handler(input.files[0]); input.value = ""; });
+  input.addEventListener("change", () => { if (input.files.length) handler([...input.files]); input.value = ""; });
 }
 
+// Photo history: every photo, newest set first. Each photo knows its set, so the
+// strip below the picture shows the set's date, its note and the photo's own note.
 function gallery(p) {
   if (!p.photos.length) {
     return `<div class="photo big">${LEAF}<span class="num">${p.number}</span><span class="note">No photo yet</span></div>`;
@@ -130,40 +141,75 @@ function gallery(p) {
       ${nav}
       <button class="btn small danger" id="gal-del">Delete</button>
     </div>
-    <p class="gal-note" id="gal-note"></p>`;
+    <div class="gal-notes">
+      <div class="note-line"><span class="note-label">Set note</span><span class="note-text" id="gal-set-note"></span>
+        <button class="btn icon small-x" id="gal-set-edit" aria-label="Edit set note">✏️</button></div>
+      <div class="note-line"><span class="note-label">Photo note</span><span class="note-text" id="gal-note"></span>
+        <button class="btn icon small-x" id="gal-note-edit" aria-label="Edit photo note">✏️</button></div>
+    </div>`;
 }
 
-function wireGallery(p) {
+function wireGallery(p, startPhotoId = null) {
   const gal = document.getElementById("gal");
   if (!gal) return;
-  let index = 0;
+  let index = Math.max(0, p.photos.findIndex(ph => ph.id === startPhotoId));
+  const sets = new Map(p.sets.map((s, i) => [s.id, { ...s, n: i }]));
+  const setText = (el, text) => { el.textContent = text || "none"; el.classList.toggle("muted", !text); };
   const show = () => {
     const ph = p.photos[index];
+    const s = sets.get(ph.set_id);
+    const pos = s ? s.photos.findIndex(x => x.id === ph.id) : 0;
     document.getElementById("gal-date").textContent = fmtWhen(ph.taken_at);
-    document.getElementById("gal-count").textContent = p.photos.length > 1 ? `· ${index + 1} of ${p.photos.length}${index === 0 ? " (latest)" : ""}` : "";
-    const note = document.getElementById("gal-note");
-    note.textContent = ph.note;
-    note.hidden = !ph.note;
+    document.getElementById("gal-count").textContent = s && s.photos.length > 1
+      ? `· photo ${pos + 1} of ${s.photos.length} in this set${s.n === 0 ? " (latest)" : ""}`
+      : (s && s.n === 0 && p.sets.length > 1 ? "· latest" : "");
+    setText(document.getElementById("gal-set-note"), s ? s.note : "");
+    setText(document.getElementById("gal-note"), ph.note);
     const prev = document.getElementById("gal-prev"), next = document.getElementById("gal-next");
     if (prev) prev.disabled = index === 0;
     if (next) next.disabled = index === p.photos.length - 1;
   };
-  const go = i => gal.scrollTo({ left: i * gal.clientWidth, behavior: "smooth" });
+  const go = (i, smooth = true) => gal.scrollTo({ left: i * gal.clientWidth, behavior: smooth ? "smooth" : "auto" });
   gal.addEventListener("scroll", () => {
     const i = Math.round(gal.scrollLeft / gal.clientWidth);
     if (i !== index && i >= 0 && i < p.photos.length) { index = i; show(); }
   }, { passive: true });
   document.getElementById("gal-prev")?.addEventListener("click", () => go(index - 1));
   document.getElementById("gal-next")?.addEventListener("click", () => go(index + 1));
+  const reload = id => viewPlant(p.number, id);
   document.getElementById("gal-del").addEventListener("click", async () => {
     const ph = p.photos[index];
-    if (!await confirmBox(`Delete the photo from ${fmtDate(ph.taken_at)}? This can't be undone.`)) return;
+    if (!await confirmBox(`Delete this photo from ${fmtDate(ph.taken_at)}? This can't be undone.`)) return;
     try {
       await api(`photos/${ph.id}`, { method: "DELETE" });
       toast("Photo deleted");
-      await viewPlant(p.number);
+      await reload(p.photos[index + 1]?.id ?? p.photos[index - 1]?.id ?? null);
     } catch (err) { toast(err.message, true); }
   });
+  document.getElementById("gal-note-edit").addEventListener("click", async () => {
+    const ph = p.photos[index];
+    const note = await noteBox(`Note for this photo (${fmtDate(ph.taken_at)})`, ph.note);
+    if (note === null || note === ph.note) return;
+    try {
+      await api(`photos/${ph.id}`, { method: "PUT", json: { note } });
+      toast("Note saved");
+      await reload(ph.id);
+    } catch (err) { toast(err.message, true); }
+  });
+  document.getElementById("gal-set-edit").addEventListener("click", async () => {
+    const ph = p.photos[index];
+    const s = sets.get(ph.set_id);
+    if (!s) return;
+    const label = s.photos.length > 1 ? `Note for this set (${s.photos.length} photos)` : "Note for this set";
+    const note = await noteBox(label, s.note);
+    if (note === null || note === s.note) return;
+    try {
+      await api(`sets/${s.id}`, { method: "PUT", json: { note } });
+      toast("Note saved");
+      await reload(ph.id);
+    } catch (err) { toast(err.message, true); }
+  });
+  if (index) requestAnimationFrame(() => go(index, false));
   show();
 }
 
@@ -188,11 +234,17 @@ async function viewHome() {
         <div class="tile-sub">${p.position ? esc(p.position) : esc(p.species) || "&nbsp;"}</div>
         <span class="chip${p.last_watered ? "" : " dim"}">${p.last_watered ? "💧 " + esc(ago(p.last_watered)) : "💧 not logged"}</span>
         <span class="chip${p.latest_photo ? "" : " dim"}">${p.latest_photo ? "📷 " + esc(ago(p.latest_photo.taken_at)) : "No photo"}</span>
+        ${p.waiting ? `<span class="chip waiting">🔍 Waiting for check</span>` : ""}
+        ${p.new_diagnosis ? `<span class="chip new">🩺 New diagnosis</span>` : ""}
+        ${p.open_actions ? `<span class="chip todo">☐ ${p.open_actions} to do</span>` : ""}
       </div></a>`;
+  const waiting = data.waiting.length;
   let html = `<div class="home-head">
       <p class="summary">${data.count} plants · next: ${esc(data.next_check.label)}, ${esc(fmtWhen(data.next_check.at))}</p>
       <a class="btn primary" href="#/round">💧 Water round</a>
-    </div>`;
+    </div>
+    ${waiting ? `<p class="waiting-bar">🔍 <strong>${waiting} plant${waiting === 1 ? "" : "s"} waiting for check</strong>
+      <span class="muted">— new photos since the last diagnosis. Say “plant check” to Claude.</span></p>` : ""}`;
   for (const a of data.areas) {
     const spots = a.spots.filter(s => s.plants.length);
     if (!spots.length) continue;
@@ -208,7 +260,7 @@ async function viewHome() {
   view.innerHTML = html;
 }
 
-async function viewPlant(number) {
+async function viewPlant(number, startPhotoId = null) {
   const p = await api(`plants/${number}`);
   setBar(`${p.number} · ${p.name}`, "#/");
   const fact = (label, value) => value ? `<div><dt>${label}</dt><dd>${esc(value)}</dd></div>` : "";
@@ -230,12 +282,74 @@ async function viewPlant(number) {
     </dl></div>
     ${p.care_notes ? `<div class="card"><h3>Care notes</h3><p class="prose">${esc(p.care_notes)}</p></div>` : ""}
     ${wateringCard(p)}
-    <div class="card"><h3>Diagnoses</h3><p class="later">Coming in the next stage: Claude's diagnoses from the “plant check” in chat.</p></div>
+    ${diagnosisCard(p)}
     <div class="card"><h3>Location history</h3>${log}</div>
     <div class="row-actions"><a class="btn" href="#/plant/${p.number}/edit">Edit details</a></div>`;
-  wireGallery(p);
+  wireGallery(p, startPhotoId);
   wireWatering(p);
-  onPick("pp", file => { pendingPhoto = { number: p.number, file }; location.hash = `#/photo/${p.number}`; });
+  wireDiagnoses(p);
+  onPick("pp", files => { pendingPhoto = { number: p.number, files }; location.hash = `#/photo/${p.number}`; });
+  // Opening the plant marks its new diagnoses as read (clears the tile chip).
+  if (p.new_diagnosis) api(`plants/${p.number}/seen`, { method: "POST" }).catch(() => {});
+}
+
+function actionItem(a) {
+  return `<li class="action${a.done_at ? " done" : ""}" data-action="${a.id}">
+      <label class="check"><input type="checkbox"${a.done_at ? " checked" : ""}> <span>${esc(a.text)}</span></label>
+      ${a.done_at ? `<span class="muted small">done ${esc(fmtDate(a.done_at))}</span>` : ""}
+    </li>`;
+}
+
+function diagnosisCard(p) {
+  const open = p.diagnoses.flatMap(d => d.actions.filter(a => !a.done_at).map(a => ({ ...a, from: d.at })));
+  const waitingLine = p.waiting
+    ? `<p class="waiting-bar small">🔍 ${p.waiting_photos} new photo${p.waiting_photos === 1 ? "" : "s"} since the last diagnosis — say “plant check ${p.number}” to Claude.</p>`
+    : "";
+  const todo = open.length
+    ? `<h3>To do</h3><ul class="actions">${open.map(actionItem).join("")}</ul>`
+    : "";
+  const thumbs = d => d.photo_ids.length
+    ? `<div class="diag-photos">${d.photo_ids.map(id => `<button type="button" class="diag-thumb" data-photo="${id}" aria-label="Show photo"><img src="api/photos/${id}/thumb" alt="" loading="lazy"></button>`).join("")}</div>`
+    : "";
+  const entry = (d, i) => `<li class="diag${!d.seen ? " unread" : ""}" data-diag="${d.id}">
+      <div class="diag-head"><strong>${esc(fmtDate(d.at))}</strong>
+        <span class="muted small">${d.source === "claude" ? "Claude" : esc(d.source)}${!d.seen ? " · new" : ""}${i === 0 ? " · latest" : ""}</span>
+        <button class="btn icon small-x" data-act="diag-del" aria-label="Delete diagnosis">✕</button></div>
+      <p class="prose">${esc(d.finding)}</p>
+      ${d.actions.length ? `<ul class="actions">${d.actions.map(actionItem).join("")}</ul>` : ""}
+      ${thumbs(d)}
+    </li>`;
+  const history = p.diagnoses.length
+    ? `<h3>History</h3><ul class="log diags">${p.diagnoses.map(entry).join("")}</ul>`
+    : `<p class="later">No diagnoses yet. Add photos, then say “plant check” to Claude.</p>`;
+  return `<div class="card"><h3>Diagnoses</h3>${waitingLine}${todo}${history}</div>`;
+}
+
+function wireDiagnoses(p) {
+  view.querySelectorAll("[data-action] input").forEach(box => box.addEventListener("change", async () => {
+    const id = box.closest("[data-action]").dataset.action;
+    try {
+      await api(`actions/${id}`, { method: "PUT", json: { done: box.checked } });
+      toast(box.checked ? "Done ✓" : "Marked as not done");
+      await viewPlant(p.number);
+    } catch (err) { box.checked = !box.checked; toast(err.message, true); }
+  }));
+  view.querySelectorAll('[data-act="diag-del"]').forEach(btn => btn.addEventListener("click", async () => {
+    const id = btn.closest("[data-diag]").dataset.diag;
+    if (!await confirmBox("Delete this diagnosis and its actions? This can't be undone.")) return;
+    try {
+      await api(`diagnoses/${id}`, { method: "DELETE" });
+      toast("Diagnosis deleted");
+      await viewPlant(p.number);
+    } catch (err) { toast(err.message, true); }
+  }));
+  view.querySelectorAll(".diag-thumb").forEach(btn => btn.addEventListener("click", () => {
+    const i = p.photos.findIndex(ph => ph.id === Number(btn.dataset.photo));
+    const gal = document.getElementById("gal");
+    if (i < 0 || !gal) return;
+    gal.scrollTo({ left: i * gal.clientWidth, behavior: "auto" });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }));
 }
 
 function careLine(c) {
@@ -358,10 +472,10 @@ async function viewRound() {
 
 async function viewPhoto(number) {
   const ov = await api("overview");
-  let file = pendingPhoto && (number === null || pendingPhoto.number === number) ? pendingPhoto.file : null;
+  let files = pendingPhoto && (number === null || pendingPhoto.number === number) ? pendingPhoto.files : [];
   pendingPhoto = null;
   const back = number ? `#/plant/${number}` : "#/";
-  setBar("New photo", back);
+  setBar("New photos", back);
 
   let options = number ? "" : `<option value="">— Choose a plant —</option>`;
   for (const a of ov.areas) {
@@ -375,52 +489,83 @@ async function viewPhoto(number) {
 
   view.innerHTML = `<form id="photo-form" autocomplete="off">
     <div class="field"><label for="ph-plant">Plant</label><select id="ph-plant" name="plant">${options}</select></div>
-    <div id="ph-preview"></div>
+    <div id="ph-preview" class="previews"></div>
     <div class="row-actions" id="ph-pick">${pickButtons("np")}</div>
-    <p class="muted hint-line">Take the photo with the camera app first, then pick it here.</p>
-    <div class="field"><label for="ph-note">Note <span class="hint">optional — e.g. new leaf, yellowing on the left</span></label>
-      <textarea id="ph-note" name="note" maxlength="500"></textarea></div>
+    <p class="muted hint-line">Take the photos with the camera app first, then pick them here — several at once is fine (e.g. top, underside, close-up). They're saved together as one set.</p>
+    <div class="field"><label for="ph-note">Set note <span class="hint">optional — for all of these photos, e.g. lower leaves yellowing</span></label>
+      <textarea id="ph-note" name="note" maxlength="1000"></textarea></div>
     <div class="row-actions">
-      <button class="btn primary" type="submit" id="ph-save" disabled>Save photo</button>
+      <button class="btn primary" type="submit" id="ph-save" disabled>Save</button>
       <a class="btn" href="${back}">Cancel</a>
     </div></form>`;
 
   const preview = document.getElementById("ph-preview");
   const save = document.getElementById("ph-save");
-  let previewUrl = null;
-  const setFile = f => {
-    file = f;
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = URL.createObjectURL(f);
-    preview.innerHTML = `<div class="preview"><img src="${previewUrl}" alt="Photo to save"></div>`;
-    save.disabled = false;
+  // Each picked photo: the file, a preview URL and its own note (kept while editing the list).
+  let items = [];
+  const label = () => items.length ? `Save ${items.length} photo${items.length === 1 ? "" : "s"}` : "Save";
+  const render = () => {
+    preview.innerHTML = items.map((it, i) => `<div class="preview-item" data-i="${i}">
+        <div class="preview"><img src="${it.url}" alt="Photo ${i + 1} to save"></div>
+        <div class="preview-side">
+          <input type="text" maxlength="500" placeholder="Note for this photo (optional)" aria-label="Note for photo ${i + 1}" value="${esc(it.note)}">
+          <button type="button" class="btn small danger" data-remove>Remove</button>
+        </div></div>`).join("");
+    preview.querySelectorAll(".preview-item").forEach(el => {
+      const it = items[Number(el.dataset.i)];
+      el.querySelector("input").addEventListener("input", e => { it.note = e.target.value; });
+      el.querySelector("[data-remove]").addEventListener("click", () => {
+        URL.revokeObjectURL(it.url);
+        items = items.filter(x => x !== it);
+        render();
+      });
+    });
+    save.disabled = !items.length;
+    save.textContent = label();
     const pick = document.querySelector('#ph-pick label[for="np-file"]');
-    pick.textContent = "Choose another";
-    pick.classList.remove("primary");
+    pick.textContent = items.length ? "Add more" : "Add photos";
+    pick.classList.toggle("primary", !items.length);
   };
-  onPick("np", setFile);
-  if (file) setFile(file);
+  const addFiles = list => {
+    for (const f of list) items.push({ file: f, url: URL.createObjectURL(f), note: "" });
+    render();
+  };
+  onPick("np", addFiles);
+  if (files.length) addFiles(files);
 
+  // A set already started by an upload that stopped half-way: a retry adds to it.
+  let started = null;
   document.getElementById("photo-form").addEventListener("submit", async e => {
     e.preventDefault();
     const target = Number(document.getElementById("ph-plant").value);
     if (!target) { toast("Choose the plant first.", true); return; }
-    if (!file) { toast("Take or choose a photo first.", true); return; }
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("note", document.getElementById("ph-note").value);
-    fd.append("taken_hint", String(file.lastModified || Date.now()));
+    if (!items.length) { toast("Choose a photo first.", true); return; }
     save.disabled = true;
-    save.textContent = "Saving…";
+    // One request per photo: the first creates the set, the rest join it.
+    let setId = started && started.plant === target ? started.setId : null, done = 0;
     try {
-      await api(`plants/${target}/photos`, { method: "POST", body: fd });
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-      toast("Photo saved");
+      for (const it of items) {
+        save.textContent = `Saving ${done + 1} of ${items.length}…`;
+        const fd = new FormData();
+        fd.append("file", it.file);
+        fd.append("note", it.note);
+        fd.append("taken_hint", String(it.file.lastModified || Date.now()));
+        if (setId) fd.append("set_id", String(setId));
+        else fd.append("set_note", document.getElementById("ph-note").value);
+        const saved = await api(`plants/${target}/photos`, { method: "POST", body: fd });
+        setId = saved.set_id;
+        done++;
+      }
+      items.forEach(it => URL.revokeObjectURL(it.url));
+      toast(done === 1 ? "Photo saved" : `${done} photos saved`);
       location.hash = `#/plant/${target}`;
     } catch (err) {
-      toast(err.message, true);
-      save.disabled = false;
-      save.textContent = "Save photo";
+      // Keep only the photos that didn't save; a retry adds them to the same set.
+      items.slice(0, done).forEach(it => URL.revokeObjectURL(it.url));
+      items = items.slice(done);
+      render();
+      toast(done ? `${done} saved; ${err.message} — tap Save to retry the rest.` : err.message, true);
+      if (setId) started = { plant: target, setId };
     }
   });
 }
