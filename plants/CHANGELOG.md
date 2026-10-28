@@ -1,8 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+- Fix: picking several photos at once did nothing in the Home Assistant phone app (its file picker returns no files for a multiple selection). Photos are now picked one at a time: after the first, **Add another photo** adds the next one to the same set.
+
 ## 0.4.0
 
-- **Photo sets:** pick several photos at once (top, underside, close-up…). They're saved together as one set with a shared **set note**, and each photo can have its own note. Photos upload one by one with progress; if one fails, the others are kept and **Save** retries the rest.
+- **Photo sets:** add several photos (top, underside, close-up…). They're saved together as one set with a shared **set note**, and each photo can have its own note. Photos upload one by one with progress; if one fails, the others are kept and **Save** retries the rest.
 - **Edit notes after saving:** ✏️ next to the set note and the photo note under the big photo.
 - **Diagnoses:** Claude writes each plant check's finding and actions to the plant (through the app's API). The plant page shows a **To do** list of open actions (tick them off) and the diagnosis history with the photos each one used.
 - **Waiting for check:** tiles show 🔍 when photos were added since the plant's last diagnosis, and the home screen shows how many plants are waiting. 🩺 **New diagnosis** shows until you open the plant; ☐ shows open actions.

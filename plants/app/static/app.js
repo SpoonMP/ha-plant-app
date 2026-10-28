@@ -113,9 +113,11 @@ function photo(p, big = false) {
 
 // One hidden file input styled as a button. The Companion app always opens the
 // file picker (it ignores a camera request), so photos are taken with the camera app first.
+// One photo per pick: the Home Assistant phone app returns nothing when several are
+// selected at once (0.4.0), so a set is built with "Add another photo".
 function pickButtons(id, label = "Add photos") {
   return `<label class="btn primary" for="${id}-file">${label}</label>
-    <input type="file" id="${id}-file" accept="image/*" multiple hidden>`;
+    <input type="file" id="${id}-file" accept="image/*" hidden>`;
 }
 
 // Hands the picked photos (one or several) to the handler as an array.
@@ -491,7 +493,7 @@ async function viewPhoto(number) {
     <div class="field"><label for="ph-plant">Plant</label><select id="ph-plant" name="plant">${options}</select></div>
     <div id="ph-preview" class="previews"></div>
     <div class="row-actions" id="ph-pick">${pickButtons("np")}</div>
-    <p class="muted hint-line">Take the photos with the camera app first, then pick them here — several at once is fine (e.g. top, underside, close-up). They're saved together as one set.</p>
+    <p class="muted hint-line">Take the photos with the camera app first, then pick them here one at a time — tap <strong>Add another photo</strong> for the next one (e.g. top, underside, close-up). They're saved together as one set.</p>
     <div class="field"><label for="ph-note">Set note <span class="hint">optional — for all of these photos, e.g. lower leaves yellowing</span></label>
       <textarea id="ph-note" name="note" maxlength="1000"></textarea></div>
     <div class="row-actions">
@@ -523,7 +525,7 @@ async function viewPhoto(number) {
     save.disabled = !items.length;
     save.textContent = label();
     const pick = document.querySelector('#ph-pick label[for="np-file"]');
-    pick.textContent = items.length ? "Add more" : "Add photos";
+    pick.textContent = items.length ? "Add another photo" : "Add photo";
     pick.classList.toggle("primary", !items.length);
   };
   const addFiles = list => {
