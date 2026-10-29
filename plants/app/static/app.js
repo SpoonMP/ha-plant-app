@@ -95,13 +95,39 @@ function fmtDate(iso) {
   return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
 }
 
+// Calendar days (local midnight to midnight), not 24-hour blocks:
+// something at 20:00 yesterday is "yesterday" at 08:00 today.
 function ago(iso) {
-  const days = Math.floor((Date.now() - new Date(iso)) / 86400000);
-  if (isNaN(days)) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const startOf = x => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  const days = Math.round((startOf(new Date()) - startOf(d)) / 86400000);
   if (days <= 0) return "today";
   if (days === 1) return "yesterday";
   if (days < 30) return `${days} d ago`;
   return fmtDate(iso);
+}
+
+// last_checked = latest entry of either kind; a "moist" check is newer than
+// the last watering when last_checked > last_watered.
+function moistSince(p) {
+  return p.last_checked && (!p.last_watered || p.last_checked > p.last_watered) ? p.last_checked : null;
+}
+
+function careChips(p) {
+  const moist = moistSince(p);
+  if (!p.last_watered && !moist) return `<span class="chip dim">💧 not logged</span>`;
+  let html = p.last_watered ? `<span class="chip">💧 ${esc(ago(p.last_watered))}</span>` : "";
+  if (moist) html += `<span class="chip">👆 moist ${esc(ago(moist))}</span>`;
+  return html;
+}
+
+function careText(p) {
+  const moist = moistSince(p);
+  const parts = [];
+  if (p.last_watered) parts.push("watered " + ago(p.last_watered));
+  if (moist) parts.push("moist " + ago(moist));
+  return parts.length ? parts.join(", ") : "not logged yet";
 }
 
 function photo(p, big = false) {
@@ -234,7 +260,7 @@ async function viewHome() {
       <div class="tile-body">
         <div class="tile-name">${esc(p.name)}</div>
         <div class="tile-sub">${p.position ? esc(p.position) : esc(p.species) || "&nbsp;"}</div>
-        <span class="chip${p.last_watered ? "" : " dim"}">${p.last_watered ? "💧 " + esc(ago(p.last_watered)) : "💧 not logged"}</span>
+        ${careChips(p)}
         <span class="chip${p.latest_photo ? "" : " dim"}">${p.latest_photo ? "📷 " + esc(ago(p.latest_photo.taken_at)) : "No photo"}</span>
         ${p.waiting ? `<span class="chip waiting">🔍 Waiting for check</span>` : ""}
         ${p.new_diagnosis ? `<span class="chip new">🩺 New diagnosis</span>` : ""}
@@ -411,7 +437,7 @@ async function viewRound() {
   const row = p => `<div class="round-row" data-number="${p.number}">
       <div class="round-info">
         <div><span class="n">${p.number}</span> ${esc(p.name)}</div>
-        <div class="muted small">${p.watering_rule ? esc(p.watering_rule) + " · " : ""}${p.last_watered ? "watered " + esc(ago(p.last_watered)) : "not logged yet"}</div>
+        <div class="muted small">${p.watering_rule ? esc(p.watering_rule) + " · " : ""}${esc(careText(p))}</div>
       </div>
       <div class="seg" role="group" aria-label="Plant ${p.number}">
         <button type="button" data-kind="checked">Moist</button>

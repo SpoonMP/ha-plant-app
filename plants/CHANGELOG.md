@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2
+
+- Fix: "today" / "yesterday" now follow calendar days. Something logged at 20:00 showed as "today" until 20:00 the next day.
+- Plants checked and still moist no longer show "not logged": tiles show a 👆 **moist** chip (when the check is newer than the last watering), and the Water round shows it next to the last watering.
+
 ## 0.4.1
 
 - Fix: picking several photos at once did nothing in the Home Assistant phone app (its file picker returns no files for a multiple selection). Photos are now picked one at a time: after the first, **Add another photo** adds the next one to the same set.
