@@ -43,7 +43,7 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse, PlainT
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from . import db, photos
+from . import db, ha, photos
 from .publisher import Publisher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -51,7 +51,7 @@ log = logging.getLogger("plants")
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 
 mqtt = Publisher(VERSION, lambda: next_check()["at"])
 
@@ -61,6 +61,10 @@ def _watered_from_ha(number: int) -> None:
     with db.session() as con:
         db.add_care(con, number, "watered", source="ha")
     mqtt.publish_plant(number, image=False)
+    try:
+        resolve_soil_readings()
+    except Exception:
+        log.exception("Soil readings failed")
 
 
 mqtt.on_watered = _watered_from_ha
@@ -171,6 +175,8 @@ class RevalidatingStatic(StaticFiles):
 async def api_overview(request):
     with db.session() as con:
         data = db.overview(con)
+    plants = [p for a in data["areas"] for s in a["spots"] for p in s["plants"]] + data["unplaced"]
+    await run_in_threadpool(_attach_soil, plants)
     data["next_check"] = next_check()
     data["version"] = VERSION
     return ok(data)
@@ -210,6 +216,125 @@ async def api_plants_create(request):
     return ok(p, 201)
 
 
+# ---------- soil sensors (read from Home Assistant) ----------
+
+def _attach_soil(plants: list) -> None:
+    """Add the current soil reading + status to each plant that has a sensor (cached ~1 min)."""
+    for p in plants:
+        if not p.get("soil_sensor"):
+            p["soil"] = None
+            continue
+        st = ha.state(p["soil_sensor"])
+        value = st["value"] if st else None
+        p["soil"] = {
+            "value": value,
+            "unit": (st or {}).get("unit") or "%",
+            "at": (st or {}).get("at"),
+            "status": db.soil_status(value, p.get("soil_threshold")),
+        }
+
+
+def _value_at(points: list, when: datetime):
+    """Last value at or before `when` from [(iso, value)] oldest first."""
+    best = None
+    for at, v in points:
+        if datetime.fromisoformat(at) <= when:
+            best = (at, v)
+        else:
+            break
+    return best
+
+
+def resolve_soil_readings() -> int:
+    """Fill in calibration readings whose time has come, from HA's history.
+    before = lowest value in the 6 h up to the Watered log (the pre-watering dry point,
+    even if the log was saved a while after watering); wet / moist = value at that time."""
+    with db.session() as con:
+        due = db.due_soil_readings(con)
+    done = 0
+    for r in due:
+        due_at = datetime.fromisoformat(r["due_at"])
+        lookback = timedelta(hours=6 if r["kind"] == "before" else 3)
+        hist = ha.history(r["entity"], due_at - lookback, due_at + timedelta(minutes=1))
+        if hist is None:
+            continue  # HA not reachable — try again next time
+        pts = [(at, v) for at, v in hist if datetime.fromisoformat(at) <= due_at]
+        if r["kind"] == "before" and pts:
+            at, v = min(pts, key=lambda x: x[1])
+            found = (at, v)
+        else:
+            found = _value_at(pts, due_at)
+        with db.session() as con:
+            if found:
+                db.set_soil_reading(con, r["id"], "done", found[1], db.norm_time(found[0]))
+                done += 1
+            elif datetime.now().astimezone() - due_at > timedelta(hours=6):
+                db.set_soil_reading(con, r["id"], "missing")
+    return done
+
+
+async def resolve_soil_soon() -> None:
+    try:
+        await run_in_threadpool(resolve_soil_readings)
+    except Exception:
+        log.exception("Soil readings failed")
+
+
+def _downsample(points: list, limit: int = 400) -> list:
+    if len(points) <= limit:
+        return points
+    step = len(points) / limit
+    out = [points[int(i * step)] for i in range(limit)]
+    if out[-1] != points[-1]:
+        out.append(points[-1])
+    return out
+
+
+@handle
+async def api_soil(request):
+    """Soil card for one plant: current reading, status, 24 h change, 7-day history,
+    waterings in that time, threshold and calibration readings."""
+    number = int(request.path_params["number"])
+    days = min(10, max(1, int(request.query_params.get("days", "7"))))
+    with db.session() as con:
+        p = db.get_plant(con, number)
+        calibration = db.soil_calibration(con, number)
+        readings = db.list_soil_readings(con, number)
+    entity = p["soil_sensor"]
+    if not entity:
+        return ok({"entity": None})
+    now = datetime.now().astimezone()
+    start = now - timedelta(days=days)
+    cur, hist = await asyncio.gather(
+        run_in_threadpool(ha.state, entity, True),
+        run_in_threadpool(ha.history, entity, start),
+    )
+    value = cur["value"] if cur else None
+    change_24h = None
+    if hist and value is not None:
+        old = _value_at(hist, now - timedelta(hours=24))
+        if old:
+            change_24h = round(value - old[1], 1)
+    waterings = [c for c in p["care_log"] if datetime.fromisoformat(c["at"]) >= start]
+    return ok({
+        "entity": entity,
+        "ha": ha.available() and cur is not None,
+        "value": value,
+        "state": cur["state"] if cur else None,
+        "unit": (cur or {}).get("unit") or "%",
+        "at": (cur or {}).get("at"),
+        "status": db.soil_status(value, p["soil_threshold"]),
+        "threshold": p["soil_threshold"],
+        "change_24h": change_24h,
+        "days": days,
+        "start": start.isoformat(timespec="seconds"),
+        "history": [[db.norm_time(at), v] for at, v in _downsample(hist or [])],
+        "care": [{"at": c["at"], "kind": c["kind"]} for c in waterings],
+        "calibration": calibration,
+        "readings": readings,
+    })
+
+
 # ---------- API: watering ----------
 
 def _care_entry(data: dict) -> tuple[str, bool, str]:
@@ -227,6 +352,7 @@ async def api_care_add(request):
         care_id = db.add_care(con, number, kind, fed, note)
         p = db.get_plant(con, number)
     await publish(number, image=False)
+    asyncio.create_task(resolve_soil_soon())
     return ok({"id": care_id, "plant": p}, 201)
 
 
@@ -256,6 +382,7 @@ async def api_round(request):
             numbers.append(number)
     for n in numbers:
         await publish(n, image=False)
+    asyncio.create_task(resolve_soil_soon())
     watered = sum(1 for e in entries if (e.get("kind") or "watered") == "watered")
     return ok({"watered": watered, "checked": len(entries) - watered}, 201)
 
@@ -556,6 +683,7 @@ async def api_health(request):
         "local_time": datetime.now().astimezone().isoformat(timespec="seconds"),
         "photos": stats,
         "mqtt": mqtt.status(),
+        "ha_api": ha.available(),
     })
 
 
@@ -585,12 +713,20 @@ async def next_check_loop():
         await publish_all(image=False)
 
 
+async def soil_loop():
+    """Every 5 minutes, fill in calibration readings that have come due."""
+    while True:
+        await resolve_soil_soon()
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(app):
     db.init_db()
     os.makedirs(photos.PHOTO_DIR, exist_ok=True)
     mqtt.start()
-    tasks = [asyncio.create_task(retention_loop()), asyncio.create_task(next_check_loop())]
+    tasks = [asyncio.create_task(retention_loop()), asyncio.create_task(next_check_loop()),
+             asyncio.create_task(soil_loop())]
     yield
     for t in tasks:
         t.cancel()
@@ -606,6 +742,7 @@ routes = [
     Route("/api/plants/{number:int}", api_plant, methods=["GET", "PUT", "DELETE"]),
     Route("/api/plants/{number:int}/photos", api_photo_upload, methods=["POST"]),
     Route("/api/plants/{number:int}/care", api_care_add, methods=["POST"]),
+    Route("/api/plants/{number:int}/soil", api_soil),
     Route("/api/care/{id:int}", api_care_delete, methods=["DELETE"]),
     Route("/api/round", api_round, methods=["POST"]),
     Route("/api/photos/{id:int}", api_photo, methods=["GET", "PUT", "DELETE"]),

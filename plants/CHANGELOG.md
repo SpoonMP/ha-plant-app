@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0
+
+- **Soil sensors:** set a plant's **Soil sensor entity** (its moisture sensor in Home Assistant) in Edit details. The app reads the value and its history from Home Assistant's API (`homeassistant_api: true`).
+- Tiles and the Water round show the current reading (🌱 35%); tiles turn amber with **needs water** once the reading is at or below the plant's threshold.
+- Plant page **Soil** card: current reading and status, change in 24 h, a 7-day chart (threshold line, waterings and moist checks marked; touch for values) and the calibration readings.
+- **Threshold** per plant ("Needs water at or below %"). Blank = **not calibrated yet**.
+- **Calibration readings, collected automatically:** a **Watered** log stores the reading just before watering (lowest value in the 6 h up to the log) and the reading 1 h later; **Checked, still moist** stores the reading at that moment. After two waterings the card suggests a threshold (the average before-watering reading) with a **Use it** button — it keeps improving with each watering. Deleting a log entry deletes its readings.
+- Plant check bundle and Export include the threshold and calibration readings.
+
 ## 0.4.2
 
 - Fix: "today" / "yesterday" now follow calendar days. Something logged at 20:00 showed as "today" until 20:00 the next day.

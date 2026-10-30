@@ -263,3 +263,33 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 @media (min-width: 640px) {
   .grid { grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px; }
 }
+
+/* soil card (0.5.0) */
+.soil-now { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.soil-now .chip { margin: 0; }
+.soil-value { font-size: 30px; font-weight: 650; letter-spacing: -.02em; }
+.soil-chart { position: relative; margin: 8px 0 4px; }
+.soil-chart svg { display: block; max-width: 100%; height: auto; touch-action: pan-y; }
+.soil-chart .grid { stroke: var(--line); stroke-width: 1; }
+.soil-chart .tick { stroke: var(--ink-2); stroke-width: 1; }
+.soil-chart .axis { fill: var(--ink-2); font-size: 11px; }
+.soil-chart .line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.soil-chart .thr { stroke: var(--ink-2); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.soil-chart .mark-w { fill: #3f7fbf; stroke: var(--surface); stroke-width: 2; }
+.soil-chart .mark-m { fill: var(--surface); stroke: #3f7fbf; stroke-width: 2; }
+.soil-chart .cross { stroke: var(--ink-2); stroke-width: 1; }
+.soil-chart .dot { fill: var(--accent); stroke: var(--surface); stroke-width: 2; }
+.soil-chart .hit { fill: transparent; }
+.sc-tip { position: absolute; top: -4px; background: var(--ink); color: var(--surface); font-size: 12px;
+  padding: 3px 8px; border-radius: 8px; white-space: nowrap; pointer-events: none; }
+.sc-key span { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: -1px; margin-left: 8px; }
+.sc-key span:first-child { margin-left: 0; }
+.sc-key .key-w { background: #3f7fbf; }
+.sc-key .key-m { border: 2px solid #3f7fbf; }
+.sc-key .key-t { width: 14px; height: 0; border-radius: 0; border-top: 2px dashed var(--ink-2); vertical-align: 3px; }
+@media (prefers-color-scheme: dark) {
+  .soil-chart .mark-w, .sc-key .key-w { fill: #7fb2e5; background: #7fb2e5; }
+  .soil-chart .mark-m { stroke: #7fb2e5; }
+  .sc-key .key-m { border-color: #7fb2e5; }
+}
+.soil-chart .thr-label { paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }

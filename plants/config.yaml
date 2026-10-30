@@ -1,5 +1,5 @@
 name: "Plants"
-version: "0.4.2"
+version: "0.5.0"
 slug: "plants"
 description: "Plant tiles, care details, photos and watering for your houseplants"
 url: "https://github.com/SpoonMP/ha-plant-app"
@@ -15,3 +15,4 @@ panel_icon: "mdi:sprout"
 panel_title: "Plants"
 services:
   - "mqtt:want"
+homeassistant_api: true

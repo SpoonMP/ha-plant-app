@@ -5,14 +5,15 @@ which Home Assistant includes in its backups.
 """
 
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DATA_DIR = os.environ.get("PLANTS_DATA_DIR", "/data").strip()
 DB_PATH = os.path.join(DATA_DIR, "plants.db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -96,6 +97,19 @@ CREATE TABLE IF NOT EXISTS diagnosis_actions (
     text         TEXT NOT NULL,
     done_at      TEXT
 );
+CREATE TABLE IF NOT EXISTS soil_readings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_number INTEGER NOT NULL REFERENCES plants(number) ON DELETE CASCADE,
+    care_id      INTEGER REFERENCES care_log(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL CHECK (kind IN ('before', 'wet', 'moist')),
+    entity       TEXT NOT NULL,
+    due_at       TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'done', 'missing')),
+    value        REAL,
+    read_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS soil_by_plant ON soil_readings (plant_number, due_at);
+CREATE INDEX IF NOT EXISTS soil_pending ON soil_readings (status, due_at);
 CREATE TABLE IF NOT EXISTS diagnosis_photos (
     diagnosis_id INTEGER NOT NULL REFERENCES diagnoses(id) ON DELETE CASCADE,
     photo_id     INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
@@ -148,6 +162,7 @@ def init_db() -> None:
         # Highest plant number ever used, so numbers of removed plants are never reused.
         con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('max_number', '0')")
         _migrate_photo_sets(con)
+        _migrate_soil(con)
 
 
 def _migrate_photo_sets(con) -> None:
@@ -162,6 +177,13 @@ def _migrate_photo_sets(con) -> None:
         ).lastrowid
         con.execute("UPDATE photos SET set_id=? WHERE id=?", (set_id, r["id"]))
     con.execute("CREATE INDEX IF NOT EXISTS photos_by_set ON photos (set_id)")
+
+
+def _migrate_soil(con) -> None:
+    """0.5.0: per-plant soil threshold (blank = not calibrated)."""
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(plants)")}
+    if "soil_threshold" not in cols:
+        con.execute("ALTER TABLE plants ADD COLUMN soil_threshold REAL")
 
 
 def norm_time(value) -> str:
@@ -293,10 +315,26 @@ def _clean_plant_fields(data: dict) -> dict:
             out[f] = "" if v is None else str(v).strip()
     if "name" in out and not out["name"]:
         raise UserError("Name can't be empty.")
+    if out.get("soil_sensor") and not re.fullmatch(r"sensor\.[a-z0-9_]+", out["soil_sensor"]):
+        raise UserError("Soil sensor must be a sensor entity ID, e.g. sensor.soil_sensor_bedroom_soil_moisture.")
+    if "soil_threshold" in data:
+        out["soil_threshold"] = parse_threshold(data["soil_threshold"])
     if "spot_id" in data:
         v = data["spot_id"]
         out["spot_id"] = int(v) if v not in (None, "", "null") else None
     return out
+
+
+def parse_threshold(v):
+    if v is None or str(v).strip() in ("", "null", "none"):
+        return None
+    try:
+        t = float(str(v).strip().rstrip("%"))
+    except ValueError:
+        raise UserError("Soil threshold must be a number (0–100) or blank.")
+    if not 0 <= t <= 100:
+        raise UserError("Soil threshold must be between 0 and 100.")
+    return round(t, 1)
 
 
 def create_plant(con, data: dict) -> int:
@@ -521,17 +559,100 @@ def list_care(con, number: int, limit: int = 30) -> list:
 
 
 def add_care(con, number: int, kind: str, fed: bool = False, note: str = "",
-             source: str = "app", at: str | None = None) -> int:
+             source: str = "app", at: str | None = None, queue_soil: bool = True) -> int:
     if kind not in CARE_KINDS:
         raise UserError("Unknown entry — use watered or checked.")
-    if not con.execute("SELECT 1 FROM plants WHERE number=?", (number,)).fetchone():
+    plant = con.execute("SELECT soil_sensor FROM plants WHERE number=?", (number,)).fetchone()
+    if not plant:
         raise KeyError(number)
     if fed and kind != "watered":
         raise UserError("Feed is only logged together with watering.")
-    return con.execute(
+    at = at or now_iso()
+    care_id = con.execute(
         "INSERT INTO care_log (plant_number, at, kind, fed, note, source) VALUES (?,?,?,?,?,?)",
-        (number, at or now_iso(), kind, 1 if fed else 0, (note or "").strip()[:500], source),
+        (number, at, kind, 1 if fed else 0, (note or "").strip()[:500], source),
     ).lastrowid
+    if queue_soil and plant["soil_sensor"]:
+        queue_soil_readings(con, number, care_id, kind, at, plant["soil_sensor"])
+    return care_id
+
+
+# ---------- soil calibration readings ----------
+
+# A Watered log records the reading just before watering ("before" = the plant's dry
+# point, when Michael decided it needed water) and the reading ~1 h later ("wet").
+# A "Checked, still moist" log records the reading at that moment ("moist").
+WET_AFTER = timedelta(minutes=60)
+SOIL_KIND_LABELS = {"before": "Before watering", "wet": "1 h after watering", "moist": "Checked, still moist"}
+
+
+def queue_soil_readings(con, number: int, care_id: int, kind: str, at: str, entity: str) -> None:
+    rows = [("moist", at)] if kind == "checked" else [
+        ("before", at),
+        ("wet", (datetime.fromisoformat(at) + WET_AFTER).isoformat(timespec="seconds")),
+    ]
+    for rkind, due in rows:
+        con.execute(
+            "INSERT INTO soil_readings (plant_number, care_id, kind, entity, due_at) VALUES (?,?,?,?,?)",
+            (number, care_id, rkind, entity, due),
+        )
+
+
+def due_soil_readings(con) -> list:
+    """Pending readings whose time has come (compared as real times, not text)."""
+    now = datetime.now().astimezone()
+    out = []
+    for r in con.execute("SELECT * FROM soil_readings WHERE status='pending' ORDER BY due_at"):
+        if datetime.fromisoformat(r["due_at"]) <= now:
+            out.append(dict(r))
+    return out
+
+
+def set_soil_reading(con, reading_id: int, status: str, value=None, read_at=None) -> None:
+    con.execute(
+        "UPDATE soil_readings SET status=?, value=?, read_at=? WHERE id=?",
+        (status, value, read_at, reading_id),
+    )
+
+
+def list_soil_readings(con, number: int, limit: int = 20) -> list:
+    rows = con.execute(
+        "SELECT r.id, r.kind, r.due_at, r.status, r.value, r.read_at, r.care_id, c.at AS care_at "
+        "FROM soil_readings r LEFT JOIN care_log c ON c.id=r.care_id "
+        "WHERE r.plant_number=? ORDER BY r.due_at DESC, r.id DESC LIMIT ?",
+        (number, limit),
+    )
+    return [{**dict(r), "label": SOIL_KIND_LABELS[r["kind"]]} for r in rows]
+
+
+def soil_calibration(con, number: int) -> dict:
+    """Readings collected so far, by kind, and a suggested threshold once there are
+    at least two before-watering readings (their average — refined with every watering)."""
+    out = {}
+    for kind in ("before", "wet", "moist"):
+        vals = [r[0] for r in con.execute(
+            "SELECT value FROM soil_readings WHERE plant_number=? AND kind=? AND status='done' "
+            "ORDER BY due_at DESC LIMIT 10", (number, kind))]
+        out[kind] = {
+            "count": len(vals),
+            "average": round(sum(vals) / len(vals), 1) if vals else None,
+            "low": min(vals) if vals else None,
+            "high": max(vals) if vals else None,
+        }
+    before = out["before"]
+    out["suggested_threshold"] = round(before["average"]) if before["count"] >= 2 else None
+    out["pending"] = con.execute(
+        "SELECT COUNT(*) FROM soil_readings WHERE plant_number=? AND status='pending'", (number,)
+    ).fetchone()[0]
+    return out
+
+
+def soil_status(value, threshold) -> str:
+    if value is None:
+        return "no reading"
+    if threshold is None:
+        return "not calibrated"
+    return "needs water" if value <= threshold else "ok"
 
 
 def delete_care(con, care_id: int) -> int:
@@ -709,6 +830,8 @@ def check_bundle(con, number: int) -> dict:
         "location": p["location"], "position": p["position"], "pot": p["pot"],
         "grow_light": p["grow_light"], "watering_rule": p["watering_rule"],
         "care_notes": p["care_notes"], "soil_sensor": p["soil_sensor"],
+        "soil_threshold": p["soil_threshold"],
+        "soil_calibration": soil_calibration(con, number) if p["soil_sensor"] else None,
         "last_watered": p["last_watered"], "last_checked": p["last_checked"], "last_fed": p["last_fed"],
         "care_log": p["care_log"][:15],
         "location_log": p["location_log"][:5],
@@ -815,6 +938,13 @@ def export_all(con) -> dict:
         p = {"number": r["number"]}
         for f in PLANT_TEXT_FIELDS:
             p[f] = r[f]
+        p["soil_threshold"] = r["soil_threshold"]
+        p["soil_readings"] = [
+            dict(x) for x in con.execute(
+                "SELECT kind, entity, due_at, value, read_at FROM soil_readings "
+                "WHERE plant_number=? AND status='done' ORDER BY due_at, id", (r["number"],),
+            )
+        ]
         area_spot = spot_lookup.get(r["spot_id"])
         p["area"], p["spot"] = area_spot if area_spot else (None, None)
         p["location_log"] = [
@@ -874,6 +1004,8 @@ def import_all(con, data: dict) -> dict:
         except (KeyError, TypeError, ValueError):
             raise UserError("Every plant needs a number.")
         fields = {f: p[f] for f in PLANT_TEXT_FIELDS if f in p}
+        if "soil_threshold" in p:
+            fields["soil_threshold"] = p["soil_threshold"]
         if p.get("area") and p.get("spot"):
             fields["spot_id"] = spot_id_for(str(p["area"]).strip(), str(p["spot"]).strip())
         exists = con.execute("SELECT 1 FROM plants WHERE number=?", (number,)).fetchone()
@@ -891,7 +1023,13 @@ def import_all(con, data: dict) -> dict:
                 )
             for entry in p.get("care_log", []) or []:
                 add_care(con, number, entry["kind"], bool(entry.get("fed")), entry.get("note", ""),
-                         entry.get("source", "import"), entry["at"])
+                         entry.get("source", "import"), entry["at"], queue_soil=False)
+            for entry in p.get("soil_readings", []) or []:
+                con.execute(
+                    "INSERT INTO soil_readings (plant_number, kind, entity, due_at, status, value, read_at) "
+                    "VALUES (?,?,?,?,'done',?,?)",
+                    (number, entry["kind"], entry["entity"], entry["due_at"], entry["value"], entry.get("read_at")),
+                )
             for entry in p.get("diagnoses", []) or []:
                 add_diagnosis(con, number, entry.get("finding"), entry.get("actions"), None,
                               entry.get("at"), entry.get("source", "import"), seen=True)

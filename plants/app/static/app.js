@@ -130,6 +130,19 @@ function careText(p) {
   return parts.length ? parts.join(", ") : "not logged yet";
 }
 
+// Soil sensor reading on tiles and in the Water round (from HA, ~1 min old at most).
+function soilValue(soil) {
+  return soil && soil.value !== null ? `${Math.round(soil.value)}${soil.unit === "%" ? "%" : " " + soil.unit}` : null;
+}
+
+function soilChip(p) {
+  if (!p.soil) return "";
+  const v = soilValue(p.soil);
+  if (v === null) return `<span class="chip dim">🌱 no reading</span>`;
+  if (p.soil.status === "needs water") return `<span class="chip waiting">🌱 ${v} · needs water</span>`;
+  return `<span class="chip">🌱 ${v}</span>`;
+}
+
 function photo(p, big = false) {
   if (p.latest_photo) {
     return `<div class="photo has-img"><img src="api/photos/${p.latest_photo.id}/thumb" alt="" loading="lazy"><span class="badge">${p.number}</span></div>`;
@@ -261,6 +274,7 @@ async function viewHome() {
         <div class="tile-name">${esc(p.name)}</div>
         <div class="tile-sub">${p.position ? esc(p.position) : esc(p.species) || "&nbsp;"}</div>
         ${careChips(p)}
+        ${soilChip(p)}
         <span class="chip${p.latest_photo ? "" : " dim"}">${p.latest_photo ? "📷 " + esc(ago(p.latest_photo.taken_at)) : "No photo"}</span>
         ${p.waiting ? `<span class="chip waiting">🔍 Waiting for check</span>` : ""}
         ${p.new_diagnosis ? `<span class="chip new">🩺 New diagnosis</span>` : ""}
@@ -310,15 +324,121 @@ async function viewPlant(number, startPhotoId = null) {
     </dl></div>
     ${p.care_notes ? `<div class="card"><h3>Care notes</h3><p class="prose">${esc(p.care_notes)}</p></div>` : ""}
     ${wateringCard(p)}
+    ${p.soil_sensor ? `<div class="card" id="soil-card"><h3>Soil</h3><p class="later">Loading reading…</p></div>` : ""}
     ${diagnosisCard(p)}
     <div class="card"><h3>Location history</h3>${log}</div>
     <div class="row-actions"><a class="btn" href="#/plant/${p.number}/edit">Edit details</a></div>`;
   wireGallery(p, startPhotoId);
   wireWatering(p);
   wireDiagnoses(p);
+  if (p.soil_sensor) loadSoil(p);
   onPick("pp", files => { pendingPhoto = { number: p.number, files }; location.hash = `#/photo/${p.number}`; });
   // Opening the plant marks its new diagnoses as read (clears the tile chip).
   if (p.new_diagnosis) api(`plants/${p.number}/seen`, { method: "POST" }).catch(() => {});
+}
+
+// ---------- soil card ----------
+
+const SOIL_STATUS = {
+  "ok": ["", "OK"],
+  "needs water": ["waiting", "Needs water"],
+  "not calibrated": ["dim", "Not calibrated yet"],
+  "no reading": ["dim", "No reading"],
+};
+
+async function loadSoil(p) {
+  const card = document.getElementById("soil-card");
+  let d;
+  try { d = await api(`plants/${p.number}/soil`); }
+  catch (err) { card.innerHTML = `<h3>Soil</h3><p class="later">Couldn't load the reading: ${esc(err.message)}</p>`; return; }
+  if (!document.body.contains(card)) return;  // left the page meanwhile
+  const [cls, label] = SOIL_STATUS[d.status] || ["dim", d.status];
+  const v = d.value !== null ? `${Math.round(d.value)}%` : "—";
+  const change = d.change_24h === null ? "" : `<span class="muted"> · ${d.change_24h > 0 ? "+" : ""}${Math.round(d.change_24h)} in 24 h</span>`;
+  const cal = d.calibration;
+  const stat = (k, text) => cal[k].count
+    ? `<div><dt>${text}</dt><dd>${Math.round(cal[k].average)}% avg <span class="muted">· ${cal[k].count} reading${cal[k].count === 1 ? "" : "s"}${cal[k].count > 1 ? `, ${Math.round(cal[k].low)}–${Math.round(cal[k].high)}%` : ""}</span></dd></div>`
+    : `<div><dt>${text}</dt><dd class="muted">none yet</dd></div>`;
+  const suggest = cal.suggested_threshold !== null
+    ? `<p class="small">Suggested threshold: <strong>${cal.suggested_threshold}%</strong> <span class="muted">(average before watering)</span>
+        ${d.threshold === cal.suggested_threshold ? "" : `<button class="btn small" id="soil-use">Use it</button>`}</p>`
+    : `<p class="muted small">A threshold is suggested after two waterings. Each <strong>Watered</strong> log records the reading just before watering and 1 h after; <strong>Checked, still moist</strong> records the reading then.</p>`;
+  const readingLine = r => `<li><span class="grow"><strong>${esc(r.label)}</strong> <span class="muted">${esc(fmtWhen(r.due_at))}</span></span>
+      <span>${r.status === "done" ? `${Math.round(r.value)}%` : r.status === "pending" ? `<span class="muted">waiting…</span>` : `<span class="muted">no data</span>`}</span></li>`;
+  card.innerHTML = `<h3>Soil</h3>
+    <div class="soil-now"><span class="soil-value">${v}</span>
+      <span class="chip ${cls}">${esc(label)}</span>${change}</div>
+    <p class="muted small">${d.at ? `Updated ${esc(fmtWhen(d.at))}` : (d.ha ? `Sensor: ${esc(d.state || "unknown")}` : "Home Assistant couldn't be reached")}
+      · threshold ${d.threshold !== null ? `${Math.round(d.threshold)}%` : "not set"}</p>
+    <div id="soil-chart" class="soil-chart"></div>
+    <h3>Calibration</h3>
+    <dl class="facts">${stat("before", "Before watering")}${stat("wet", "1 h after watering")}${stat("moist", "Checked, still moist")}</dl>
+    ${suggest}
+    ${d.readings.length ? `<details><summary class="small">Readings (${d.readings.length})</summary><ul class="log care">${d.readings.map(readingLine).join("")}</ul></details>` : ""}
+    <p class="muted small">${esc(d.entity)}</p>`;
+  soilChart(document.getElementById("soil-chart"), d);
+  document.getElementById("soil-use")?.addEventListener("click", async () => {
+    try {
+      await api(`plants/${p.number}`, { method: "PUT", json: { soil_threshold: cal.suggested_threshold } });
+      toast(`Threshold set to ${cal.suggested_threshold}%`);
+      await loadSoil({ ...p, soil_threshold: cal.suggested_threshold });
+    } catch (err) { toast(err.message, true); }
+  });
+}
+
+// 7-day line (0–100 %), dashed threshold, watering / moist-check marks along the bottom,
+// crosshair + tooltip on touch/hover. Single series, so no legend box — the card names it.
+function soilChart(el, d) {
+  const pts = d.history.map(([at, val]) => [new Date(at).getTime(), val]);
+  if (pts.length < 2) { el.innerHTML = `<p class="later">Not enough history for a chart yet.</p>`; return; }
+  const W = Math.max(280, el.clientWidth), H = 170, L = 30, R = 8, T = 10, B = 34;
+  const t0 = new Date(d.start).getTime(), t1 = Date.now();
+  const x = t => L + (t - t0) / (t1 - t0) * (W - L - R);
+  const y = v => T + (1 - v / 100) * (H - T - B);
+  const path = pts.map(([t, v], i) => `${i ? "L" : "M"}${x(t).toFixed(1)},${y(v).toFixed(1)}`).join("");
+  const grid = [0, 50, 100].map(g => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(g)}" y2="${y(g)}"/><text class="axis" x="${L - 6}" y="${y(g) + 4}" text-anchor="end">${g}</text>`).join("");
+  let days = "";
+  const first = new Date(t0); first.setHours(24, 0, 0, 0);
+  for (let t = first.getTime(); t < t1; t += 86400000) {
+    const dd = new Date(t);
+    days += `<line class="tick" x1="${x(t)}" x2="${x(t)}" y1="${H - B}" y2="${H - B + 4}"/>
+      <text class="axis" x="${x(t)}" y="${H - B + 16}" text-anchor="middle">${dd.toLocaleDateString("en-GB", { weekday: "narrow" })}${dd.getDate()}</text>`;
+  }
+  const thr = d.threshold !== null
+    ? `<line class="thr" x1="${L}" x2="${W - R}" y1="${y(d.threshold)}" y2="${y(d.threshold)}"/><text class="axis thr-label" x="${W - R}" y="${y(d.threshold) - 5}" text-anchor="end">needs water ≤ ${Math.round(d.threshold)}%</text>`
+    : "";
+  const marks = d.care.map(c => {
+    const cx = x(new Date(c.at).getTime());
+    return c.kind === "watered"
+      ? `<circle class="mark-w" cx="${cx}" cy="${H - B - 5}" r="4"><title>Watered ${fmtWhen(c.at)}</title></circle>`
+      : `<circle class="mark-m" cx="${cx}" cy="${H - B - 5}" r="4"><title>Checked, moist ${fmtWhen(c.at)}</title></circle>`;
+  }).join("");
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Soil moisture, last ${d.days} days">
+      ${grid}${days}${thr}<path class="line" d="${path}"/>${marks}
+      <line class="cross" id="sc-x" y1="${T}" y2="${H - B}" hidden/><circle class="dot" id="sc-dot" r="4" hidden/>
+      <rect class="hit" x="${L}" y="0" width="${W - L - R}" height="${H}"/></svg>
+    <div class="sc-tip" id="sc-tip" hidden></div>
+    <p class="muted small sc-key"><span class="key-w"></span> watered <span class="key-m"></span> checked, moist${d.threshold !== null ? ` <span class="key-t"></span> threshold` : ""}</p>`;
+  const svg = el.querySelector("svg"), tip = el.querySelector("#sc-tip");
+  const cross = el.querySelector("#sc-x"), dot = el.querySelector("#sc-dot");
+  const show = e => {
+    const r = svg.getBoundingClientRect();
+    const px = (e.clientX - r.left) * W / r.width;
+    const t = t0 + (px - L) / (W - L - R) * (t1 - t0);
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(p[0] - t) < Math.abs(best[0] - t)) best = p;
+    const bx = x(best[0]), by = y(best[1]);
+    cross.setAttribute("x1", bx); cross.setAttribute("x2", bx); cross.hidden = false;
+    dot.setAttribute("cx", bx); dot.setAttribute("cy", by); dot.hidden = false;
+    tip.innerHTML = `<strong>${Math.round(best[1])}%</strong> ${esc(fmtWhen(new Date(best[0]).toISOString()))}`;
+    tip.hidden = false;
+    const left = Math.min(Math.max(bx * r.width / W - tip.offsetWidth / 2, 0), r.width - tip.offsetWidth);
+    tip.style.left = left + "px";
+  };
+  const hide = () => { cross.hidden = dot.hidden = tip.hidden = true; };
+  svg.addEventListener("pointermove", show);
+  svg.addEventListener("pointerdown", show);
+  svg.addEventListener("pointerleave", hide);
 }
 
 function actionItem(a) {
@@ -437,7 +557,7 @@ async function viewRound() {
   const row = p => `<div class="round-row" data-number="${p.number}">
       <div class="round-info">
         <div><span class="n">${p.number}</span> ${esc(p.name)}</div>
-        <div class="muted small">${p.watering_rule ? esc(p.watering_rule) + " · " : ""}${esc(careText(p))}</div>
+        <div class="muted small">${p.watering_rule ? esc(p.watering_rule) + " · " : ""}${esc(careText(p))}${soilValue(p.soil) !== null ? ` · 🌱 ${soilValue(p.soil)}${p.soil.status === "needs water" ? " (needs water)" : ""}` : ""}</div>
       </div>
       <div class="seg" role="group" aria-label="Plant ${p.number}">
         <button type="button" data-kind="checked">Moist</button>
@@ -605,7 +725,7 @@ async function viewEdit(number) {
     isNew ? Promise.resolve(null) : api(`plants/${number}`),
     isNew ? api("overview") : Promise.resolve(null),
   ]);
-  const plant = p || { number: ov.next_number, name: "", species: "", spot_id: null, position: "", pot: "", watering_rule: "", grow_light: "", care_notes: "", soil_sensor: "" };
+  const plant = p || { number: ov.next_number, name: "", species: "", spot_id: null, position: "", pot: "", watering_rule: "", grow_light: "", care_notes: "", soil_sensor: "", soil_threshold: null };
   setBar(isNew ? "New plant" : `Edit ${plant.number}`, isNew ? "#/settings" : `#/plant/${plant.number}`);
 
   let spotOptions = `<option value="">— No location —</option>`;
@@ -632,7 +752,9 @@ async function viewEdit(number) {
     ${text("grow_light", "Grow light")}
     ${text("pot", "Pot")}
     ${area("care_notes", "Care notes")}
-    ${text("soil_sensor", "Soil sensor entity", "when one is fitted")}
+    ${text("soil_sensor", "Soil sensor entity", "moisture sensor, e.g. sensor.soil_sensor_bedroom_soil_moisture")}
+    <div class="field"><label for="f-soil_threshold">Needs water at or below (%) <span class="hint">blank = not calibrated yet</span></label>
+      <input type="number" id="f-soil_threshold" name="soil_threshold" min="0" max="100" step="1" inputmode="numeric" value="${plant.soil_threshold ?? ""}"></div>
     <div class="row-actions">
       <button class="btn primary" type="submit">${isNew ? "Add plant" : "Save"}</button>
       <a class="btn" href="${isNew ? "#/settings" : `#/plant/${plant.number}`}">Cancel</a>
