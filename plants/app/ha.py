@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger("plants.ha")
 
@@ -81,6 +81,11 @@ def state(entity_id: str, fresh: bool = False) -> dict | None:
     return out
 
 
+def _utc(when: datetime) -> str:
+    """UTC with a Z suffix: no '+' in the URL (it can turn into a space on the way through)."""
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def history(entity_id: str, start: datetime, end: datetime | None = None) -> list[tuple[str, float]] | None:
     """[(iso time, value)] oldest first, numeric states only. None if HA can't be reached."""
     params = {
@@ -89,14 +94,16 @@ def history(entity_id: str, start: datetime, end: datetime | None = None) -> lis
         "no_attributes": "",
     }
     if end:
-        params["end_time"] = end.isoformat()
-    path = "/history/period/" + urllib.parse.quote(start.isoformat()) + "?" + urllib.parse.urlencode(params)
+        params["end_time"] = _utc(end)
+    path = "/history/period/" + _utc(start) + "?" + urllib.parse.urlencode(params)
     try:
         raw = _get(path, timeout=8)
     except Exception as e:
         log.warning("Couldn't read history of %s from HA: %s", entity_id, e)
         return None
     rows = raw[0] if raw else []
+    if not rows:
+        log.info("History of %s is empty (%s)", entity_id, path)
     out = []
     for r in rows:
         v = to_number(r.get("state"))
