@@ -93,8 +93,8 @@ def history(entity_id: str, start: datetime, end: datetime | None = None) -> lis
         "minimal_response": "",
         "no_attributes": "",
     }
-    if end:
-        params["end_time"] = _utc(end)
+    # HA's history API ends at start + 1 day unless end_time is given.
+    params["end_time"] = _utc(end or datetime.now(timezone.utc))
     path = "/history/period/" + _utc(start) + "?" + urllib.parse.urlencode(params)
     try:
         raw = _get(path, timeout=8)

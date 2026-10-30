@@ -51,7 +51,7 @@ log = logging.getLogger("plants")
 
 HERE = os.path.dirname(__file__)
 STATIC = os.path.join(HERE, "static")
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 mqtt = Publisher(VERSION, lambda: next_check()["at"])
 

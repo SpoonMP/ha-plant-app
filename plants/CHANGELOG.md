@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1 / 0.5.2
+
+- Fix: the soil chart and calibration readings got no history from Home Assistant (its history API stops one day after the start time unless an end time is given; times are now also sent as UTC).
+
 ## 0.5.0
 
 - **Soil sensors:** set a plant's **Soil sensor entity** (its moisture sensor in Home Assistant) in Edit details. The app reads the value and its history from Home Assistant's API (`homeassistant_api: true`).
