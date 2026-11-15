@@ -268,7 +268,7 @@ async function viewHome() {
       </div></div>`;
     return;
   }
-  const tile = p => `<a class="tile" href="#/plant/${p.number}">
+  const tile = p => `<a class="tile" href="#/plant/${p.number}" data-number="${p.number}">
       ${photo(p)}
       <div class="tile-body">
         <div class="tile-name">${esc(p.name)}</div>
@@ -905,8 +905,39 @@ async function viewSettings() {
 
 // ---------- router ----------
 
+// Home list scroll position, kept while you open a plant (and its photo/edit screens)
+// and restored when you come back. Anchored to the tile you opened, so the list
+// lands in the same place even if chips above it changed height.
+let lastHash = null;
+if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+let homeScroll = null; // { number, offset, y }
+try { homeScroll = JSON.parse(sessionStorage.getItem("homeScroll")) || null; } catch (e) { homeScroll = null; }
+
+function isHome(h) { return !h || h === "#/" || h === "#"; }
+
+function saveHomeScroll() {
+  const y = window.scrollY;
+  let number = null, offset = 0;
+  // the tile nearest the top of the screen that is still visible
+  for (const t of view.querySelectorAll("a.tile")) {
+    const top = t.getBoundingClientRect().top;
+    if (top + t.offsetHeight > 0) { number = t.dataset.number; offset = top; break; }
+  }
+  homeScroll = { number, offset, y };
+  try { sessionStorage.setItem("homeScroll", JSON.stringify(homeScroll)); } catch (e) { /* ignore */ }
+}
+
+function restoreHomeScroll() {
+  if (!homeScroll) { window.scrollTo(0, 0); return; }
+  const t = homeScroll.number && view.querySelector(`a.tile[data-number="${homeScroll.number}"]`);
+  const y = t ? t.getBoundingClientRect().top + window.scrollY - homeScroll.offset : homeScroll.y;
+  window.scrollTo(0, Math.max(0, y));
+}
+
 async function route() {
   const h = location.hash || "#/";
+  if (isHome(lastHash) && lastHash !== null && !isHome(h)) saveHomeScroll();
+  lastHash = h;
   let m;
   try {
     if ((m = h.match(/^#\/plant\/(\d+)\/edit$/))) await viewEdit(Number(m[1]));
@@ -916,7 +947,8 @@ async function route() {
     else if ((m = h.match(/^#\/photo(?:\/(\d+))?$/))) await viewPhoto(m[1] ? Number(m[1]) : null);
     else if (h === "#/settings") await viewSettings();
     else await viewHome();
-    window.scrollTo(0, 0);
+    if (isHome(h)) restoreHomeScroll();
+    else window.scrollTo(0, 0);
   } catch (err) {
     setBar("Plants", "#/");
     view.innerHTML = `<div class="empty"><h2>Something went wrong</h2><p>${esc(err.message)}</p>

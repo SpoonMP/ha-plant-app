@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+- The plant list keeps its scroll position: open a plant (add photos, log watered / still moist, edit), go back, and you land where you were instead of at the top.
+
 ## 0.5.1 / 0.5.2
 
 - Fix: the soil chart and calibration readings got no history from Home Assistant (its history API stops one day after the start time unless an end time is given; times are now also sent as UTC).
