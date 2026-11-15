@@ -1,8 +1,9 @@
 # Changelog
 
-## 0.5.3
+## 0.5.3 / 0.5.4
 
 - The plant list keeps its scroll position: open a plant (add photos, log watered / still moist, edit), go back, and you land where you were instead of at the top.
+- 0.5.4: the app version (used to refresh the cached page script) is updated too, so the change actually loads.
 
 ## 0.5.1 / 0.5.2
 
